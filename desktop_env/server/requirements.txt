@@ -8,5 +8,4 @@ numpy
 lxml
 pygame
 pywinauto
-pyperclip
-xlsx2csv
+

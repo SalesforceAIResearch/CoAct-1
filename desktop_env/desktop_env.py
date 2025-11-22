@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 import time
+import re
 from typing import Callable, Any, Optional, Tuple
 from typing import List, Dict, Union
 
@@ -19,12 +19,83 @@ logger = logging.getLogger("desktopenv.env")
 Metric = Callable[[Any, Any], float]
 Getter = Callable[[gym.Env, Dict[str, Any]], Any]
 
+MAX_RETRIES = 5 # Maximum retries for environment setup
+            
+
+
+def _fix_pyautogui_less_than_bug(command: str) -> str:
+    """
+    Fix PyAutoGUI '<' character bug by converting it to hotkey("shift", ',') calls.
+    
+    This fixes the known PyAutoGUI issue where typing '<' produces '>' instead.
+    References:
+    - https://github.com/asweigart/pyautogui/issues/198
+    - https://github.com/xlang-ai/OSWorld/issues/257
+    
+    Args:
+        command (str): The original pyautogui command
+        
+    Returns:
+        str: The fixed command with '<' characters handled properly
+    """
+    # Pattern to match press('<') or press('\u003c') calls  
+    press_pattern = r'pyautogui\.press\(["\'](?:<|\\u003c)["\']\)'
+
+    # Handle press('<') calls
+    def replace_press_less_than(_match):
+        return 'pyautogui.hotkey("shift", ",")'
+    
+    # First handle press('<') calls
+    command = re.sub(press_pattern, replace_press_less_than, command)
+
+    # Pattern to match typewrite calls with quoted strings
+    typewrite_pattern = r'pyautogui\.typewrite\((["\'])(.*?)\1\)'
+    
+    # Then handle typewrite calls
+    def process_typewrite_match(match):
+        quote_char = match.group(1)
+        content = match.group(2)
+        
+        # Preprocess: Try to decode Unicode escapes like \u003c to actual '<'
+        # This handles cases where '<' is represented as escaped Unicode
+        try:
+            # Attempt to decode unicode escapes
+            decoded_content = content.encode('utf-8').decode('unicode_escape')
+            content = decoded_content
+        except UnicodeDecodeError:
+            # If decoding fails, proceed with original content to avoid breaking existing logic
+            pass  # English comment: Graceful degradation - fall back to original content if decoding fails
+        
+        # Check if content contains '<'
+        if '<' not in content:
+            return match.group(0)
+        
+        # Split by '<' and rebuild
+        parts = content.split('<')
+        result_parts = []
+        
+        for i, part in enumerate(parts):
+            if i == 0:
+                # First part
+                if part:
+                    result_parts.append(f"pyautogui.typewrite({quote_char}{part}{quote_char})")
+            else:
+                # Add hotkey for '<' and then typewrite for the rest
+                result_parts.append('pyautogui.hotkey("shift", ",")')
+                if part:
+                    result_parts.append(f"pyautogui.typewrite({quote_char}{part}{quote_char})")
+        
+        return '; '.join(result_parts)
+    
+    command = re.sub(typewrite_pattern, process_typewrite_match, command)
+    
+    return command
+
 
 class DesktopEnv(gym.Env):
     """
     DesktopEnv with OpenAI Gym interface. It provides a desktop environment for setting and evaluating desktop automation tasks.
     """
-
     def __init__(
             self,
             provider_name: str = "vmware",
@@ -33,14 +104,15 @@ class DesktopEnv(gym.Env):
             region: str = None,
             path_to_vm: str = None,
             snapshot_name: str = "init_state",
-            action_space: str = "computer_13",
+            action_space: str = "pyautogui",
             cache_dir: str = "cache",
-            screen_size: Tuple[int] = (1920, 1080),
+            screen_size: Tuple[int, int] = (int(os.environ.get("SCREEN_WIDTH", 1920)), int(os.environ.get("SCREEN_HEIGHT", 1080))),
             headless: bool = False,
             require_a11y_tree: bool = True,
             require_terminal: bool = False,
             os_type: str = "Ubuntu",
-            record_trajectory: bool = False,
+            enable_proxy: bool = False,
+            client_password: str = "",
     ):
         """
         Args:
@@ -55,22 +127,48 @@ class DesktopEnv(gym.Env):
             headless (bool): whether to run the VM in headless mode
             require_a11y_tree (bool): whether to require accessibility tree
             require_terminal (bool): whether to require terminal output
+            os_type (str): operating system type, default to "Ubuntu"
+            enable_proxy (bool): whether to enable proxy support, default to False
         """
-        # Initialize VM manager and vitualization provider
+        # Initialize VM manager and virtualization provider
         self.provider_name = provider_name
-        self.region = region
+        self.provider_config = provider_config
         self.hardware_config = hardware_config
-        self.record_trajectory = record_trajectory
+        self.region = region
+        self.enable_proxy = enable_proxy  # Store proxy enablement setting
+        if client_password == "":
+            if self.provider_name == "aws":
+                self.client_password = "osworld-public-evaluation"
+            else:
+                self.client_password = "password"
+        else:
+            self.client_password = client_password
 
-        # Default
+        self.screen_width = int(screen_size[0])
+        self.screen_height = int(screen_size[1])
+
+        # Default 
         self.server_port = 5000
         self.chromium_port = 9222
-        self.vnc_port = 8007
+        self.vnc_port = 8006
         self.vlc_port = 8080
-        logger.info(f"provider_name: {provider_name}, region: {region}, provider_config: {provider_config}")
+        
+        # Initialize with default (no proxy) provider
+        self.current_use_proxy = False
         self.manager, self.provider = create_vm_manager_and_provider(provider_name, region, provider_config=provider_config)
 
         self.os_type = os_type
+        self.container_name: Optional[str] = None
+
+        # Track whether environment has been used (step/setup) to optimize snapshot revert
+        # docker, aws, gcp, azure are always unused as the emulator starts from a clean state
+        # vmware, virtualbox are always used as the emulator starts from a dirty state
+        if self.provider_name in {"docker", "docker_remote", "aws", "gcp", "azure", "aliyun", "volcengine", "docker_remote_fc", "docker_remote_fc_v1"}:
+            self.is_environment_used = False
+        elif self.provider_name in {"vmware", "virtualbox"}:
+            self.is_environment_used = True
+        else:
+            raise ValueError(f"Invalid provider name: {self.provider_name}")
 
         # Initialize environment variables
         if path_to_vm:
@@ -78,11 +176,10 @@ class DesktopEnv(gym.Env):
                 if provider_name in {"vmware", "virtualbox"} else path_to_vm
         else:
             if self.manager is not None:
-                self.path_to_vm = self.manager.get_vm_path(self.os_type, region)
+                self.path_to_vm = self.manager.get_vm_path(os_type=self.os_type, region=region, screen_size=(self.screen_width, self.screen_height))
             else:
-                self.path_to_vm = None # docker_remote
-
-
+                self.path_to_vm = None
+        
         self.snapshot_name = snapshot_name
         self.cache_dir_base: str = cache_dir
         # todo: add the logic to get the screen size from the VM
@@ -90,17 +187,16 @@ class DesktopEnv(gym.Env):
         self.require_a11y_tree = require_a11y_tree
         self.require_terminal = require_terminal
 
-        logger.info("Initializing...")
         # Initialize emulator and controller
-        if provider_name not in ["docker", "docker_remote_fc", "docker_remote_fc_v1"]: # Check if this is applicable to other VM providers
-            self._start_emulator()
-
-        if provider_name in ["docker_remote_fc", "docker_remote_fc_v1"]:
+        logger.info("Initializing...")
+        if self.provider_name in ["docker_remote_fc", "docker_remote_fc_v1"]:
             self._start_container()
+        else:
+            self._start_emulator()
 
         # mode: human or machine
         self.instruction = None
-        assert action_space in ["computer_13", "pyautogui"]
+        assert action_space in ["computer_13", "pyautogui", "claude_computer_use", "autoglm_computer_use"]
         self.action_space = action_space  # todo: refactor it to the ActType
 
         # episodic stuffs, like counters, will be updated or reset
@@ -109,35 +205,24 @@ class DesktopEnv(gym.Env):
         self._step_no: int = 0
         self.action_history: List[Dict[str, any]] = []
 
+
     def _start_container(self):
-        # Power on the virtual machine
-        assert self.provider_name in ["docker_remote_fc", "docker_remote_fc_v1"] and self.hardware_config is not None
-        container_info = self.provider.start_container(self.path_to_vm, self.headless, self.os_type, **self.hardware_config)
-        self.container_name = container_info["name"]
-        self.path_to_vm = self.container_name
+        if self.provider_name not in ["docker_remote_fc", "docker_remote_fc_v1"]:
+            raise RuntimeError("_start_container is only supported for docker_remote_fc providers")
 
-        # Get the ip from the virtual machine, and setup the controller
-        vm_ip_ports = self.provider.get_ip_address(self.path_to_vm).split(':')
-        self.vm_ip = vm_ip_ports[0]
-        if len(vm_ip_ports) > 1:
-            self.server_port = int(vm_ip_ports[1])
-            self.chromium_port = int(vm_ip_ports[2])
-            self.vnc_port = int(vm_ip_ports[3])
-            self.vlc_port = int(vm_ip_ports[4])
-        self.controller = PythonController(vm_ip=self.vm_ip, server_port=self.server_port)
-        self.setup_controller = SetupController(vm_ip=self.vm_ip, server_port=self.server_port, chromium_port=self.chromium_port, vlc_port=self.vlc_port, cache_dir=self.cache_dir_base)
-
-    def _start_emulator(self):
-        # Power on the virtual machine
         if self.hardware_config is None:
-            assert self.provider_name != "docker_remote"
             self.hardware_config = {}
-        emulator_info = self.provider.start_emulator(self.path_to_vm, self.headless, self.os_type, **self.hardware_config)
-        self.container_name = emulator_info["name"]
-        if self.provider_name == "docker_remote":
+
+        container_info = self.provider.start_container(
+            self.path_to_vm,
+            self.headless,
+            self.os_type,
+            **self.hardware_config,
+        )
+        self.container_name = container_info.get("name")
+        if self.container_name:
             self.path_to_vm = self.container_name
 
-        # Get the ip from the virtual machine, and setup the controller
         vm_ip_ports = self.provider.get_ip_address(self.path_to_vm).split(':')
         self.vm_ip = vm_ip_ports[0]
         if len(vm_ip_ports) > 1:
@@ -145,20 +230,101 @@ class DesktopEnv(gym.Env):
             self.chromium_port = int(vm_ip_ports[2])
             self.vnc_port = int(vm_ip_ports[3])
             self.vlc_port = int(vm_ip_ports[4])
+
         self.controller = PythonController(vm_ip=self.vm_ip, server_port=self.server_port)
-        self.setup_controller = SetupController(vm_ip=self.vm_ip, server_port=self.server_port, chromium_port=self.chromium_port, vlc_port=self.vlc_port, cache_dir=self.cache_dir_base)
+        self.setup_controller = SetupController(
+            vm_ip=self.vm_ip,
+            server_port=self.server_port,
+            chromium_port=self.chromium_port,
+            vlc_port=self.vlc_port,
+            cache_dir=self.cache_dir_base,
+            client_password=self.client_password,
+            screen_width=self.screen_width,
+            screen_height=self.screen_height,
+        )
+
+    def _start_emulator(self):
+        try:
+            emulator_kwargs: Dict[str, Any] = self.hardware_config or {}
+            emulator_info = self.provider.start_emulator(
+                self.path_to_vm,
+                self.headless,
+                self.os_type,
+                **emulator_kwargs,
+            )
+
+            if isinstance(emulator_info, dict) and "name" in emulator_info:
+                self.container_name = emulator_info["name"]
+            if self.provider_name == "docker_remote" and self.container_name:
+                self.path_to_vm = self.container_name
+
+            vm_ip_ports = self.provider.get_ip_address(self.path_to_vm).split(':')
+            self.vm_ip = vm_ip_ports[0]
+            if len(vm_ip_ports) > 1:
+                self.server_port = int(vm_ip_ports[1])
+                self.chromium_port = int(vm_ip_ports[2])
+                self.vnc_port = int(vm_ip_ports[3])
+                self.vlc_port = int(vm_ip_ports[4])
+
+            self.controller = PythonController(vm_ip=self.vm_ip, server_port=self.server_port)
+            self.setup_controller = SetupController(
+                vm_ip=self.vm_ip,
+                server_port=self.server_port,
+                chromium_port=self.chromium_port,
+                vlc_port=self.vlc_port,
+                cache_dir=self.cache_dir_base,
+                client_password=self.client_password,
+                screen_width=self.screen_width,
+                screen_height=self.screen_height,
+            )
+
+        except Exception as e:
+            logger.error("Failed to start emulator: %s", e)
+            try:
+                if self.provider_name in ["docker_remote_fc", "docker_remote_fc_v1"]:
+                    self.provider.stop_container(self.path_to_vm)
+                else:
+                    self.provider.stop_emulator(self.path_to_vm)
+            except Exception as stop_err:
+                logger.warning("Cleanup after interrupt failed: %s", stop_err)
+            raise
 
     def _start_emulator_docker_remote_fc(self):
-        # Power on the virtual machine
-        emulator_info = self.provider.start_emulator(self.container_name)
-        return emulator_info
+        if not self.container_name:
+            raise RuntimeError("Container name not set for docker_remote_fc provider")
+
+        self.provider.start_emulator(self.container_name)
+        vm_ip_ports = self.provider.get_ip_address(self.path_to_vm).split(':')
+        self.vm_ip = vm_ip_ports[0]
+        if len(vm_ip_ports) > 1:
+            self.server_port = int(vm_ip_ports[1])
+            self.chromium_port = int(vm_ip_ports[2])
+            self.vnc_port = int(vm_ip_ports[3])
+            self.vlc_port = int(vm_ip_ports[4])
+
+        self.controller = PythonController(vm_ip=self.vm_ip, server_port=self.server_port)
+        self.setup_controller = SetupController(
+            vm_ip=self.vm_ip,
+            server_port=self.server_port,
+            chromium_port=self.chromium_port,
+            vlc_port=self.vlc_port,
+            cache_dir=self.cache_dir_base,
+            client_password=self.client_password,
+            screen_width=self.screen_width,
+            screen_height=self.screen_height,
+        )
 
     def _revert_to_snapshot(self):
         # Revert to certain snapshot of the virtual machine, and refresh the path to vm and ip of vm
         # due to the fact it could be changed when implemented by cloud services
         path_to_vm = self.provider.revert_to_snapshot(self.path_to_vm, self.snapshot_name)
-        if path_to_vm and not path_to_vm == self.path_to_vm and not self.provider_name in ["docker_remote", "docker_remote_fc", "docker_remote_fc_v1"]: # NOTE: yuh: in docker_remote, the path_to_vm is set to be the container name
-            # path_to_vm has to be a new path
+        if (
+            path_to_vm
+            and path_to_vm != self.path_to_vm
+            and self.provider_name not in ["docker_remote", "docker_remote_fc", "docker_remote_fc_v1"]
+            and self.manager is not None
+        ):
+            # path_to_vm has to be a new path 
             self.manager.delete_vm(self.path_to_vm, self.region)
             self.manager.add_vm(path_to_vm, self.region)
             self.manager.occupy_vm(path_to_vm, os.getpid(), self.region)
@@ -169,20 +335,20 @@ class DesktopEnv(gym.Env):
         self.provider.save_state(self.path_to_vm, snapshot_name)
 
     def close(self):
-        trajectories = None
         # Close (release) the virtual machine
-        if self.controller is not None:
-            if self.record_trajectory:
-                trajectories = self.controller.end_trajectory()
-                # json.dump(trajectories, open(self.cache_dir + "/trajectory.json", "w"), indent=4)
-                # logger.info("Trajectory recording stopped. Trajectory saved to {}".format(self.cache_dir + "/trajectory.json"))
         if self.provider_name in ["docker_remote_fc", "docker_remote_fc_v1"]:
             self.provider.stop_container(self.path_to_vm)
         else:
             self.provider.stop_emulator(self.path_to_vm)
-        return trajectories
-        
-    def reset(self, task_config: Optional[Dict[str, Any]] = None, seed=None, options=None) -> Dict[str, Any]:
+
+    def reset(self, task_config: Optional[Dict[str, Any]] = None, seed=None, options=None, sleep_time=10) -> Dict[str, Any]:
+        if self.provider_name == "docker_remote_fc":
+            return self.reset_docker_remote_fc(task_config, sleep_time=sleep_time)
+        if self.provider_name == "docker_remote_fc_v1":
+            return self.reset_docker_remote_fc_v1(task_config, sleep_time=sleep_time)
+
+        del seed, options
+
         # Reset to certain task in OSWorld
         logger.info("Resetting environment...")
         logger.info("Switching task...")
@@ -191,71 +357,143 @@ class DesktopEnv(gym.Env):
         self._step_no = 0
         self.action_history.clear()
 
-        logger.info("Reverting to snapshot to {}...".format(self.snapshot_name))
-        self._revert_to_snapshot()
-        logger.info("Starting emulator...")
-        self._start_emulator()
-        logger.info("Emulator started.")
-        if self.record_trajectory:
-            self.controller.start_trajectory()
-            logger.info("Trajectory recording started.")
+        for attempt in range(MAX_RETRIES):
+            # Only revert to snapshot if environment has been used (step/setup)
+            # This optimization is especially important for cloud providers like AWS
+            # where unnecessary snapshot operations are costly and time-consuming
+            
+            if task_config is not None:
+                # Only consider task proxy requirement if proxy is enabled at system level
+                task_use_proxy = task_config.get("proxy", False) and self.enable_proxy
+                if not self.enable_proxy and task_config.get("proxy", False):
+                    logger.info("Task requires proxy but proxy is disabled at system level, ignoring proxy requirement.")
+                
+                if task_use_proxy != self.current_use_proxy:
+                    # keep because get_info_from_website depend on this
+                    self.current_use_proxy = task_use_proxy
+            
+            if self.is_environment_used:
+                logger.info("Environment has been used, reverting to snapshot {}...".format(self.snapshot_name))
+                self._revert_to_snapshot()
+                logger.info("Starting emulator...")
+                self._start_emulator()
+                logger.info("Emulator started.")
+                # Reset the usage flag after reverting
+                self.is_environment_used = False
+            else:
+                logger.info("Environment is clean, skipping snapshot revert (provider: {}).".format(self.provider_name))
 
-        if task_config is not None:
-            self._set_task_info(task_config)
-            self.setup_controller.reset_cache_dir(self.cache_dir)
-            logger.info("Setting up environment...")
-            self.setup_controller.setup(self.config)
-            logger.info("Environment setup complete.")
+            if task_config is not None:
+                self.controller.set_vm_screen_size(self.screen_width, self.screen_height)
+                if task_config.get("proxy", False) and self.enable_proxy:
+                    # If using proxy and proxy is enabled, set up the proxy configuration
+                    self.setup_controller._proxy_setup(self.client_password)
+                self._set_task_info(task_config)
+                self.setup_controller.reset_cache_dir(self.cache_dir)
+                logger.info("Setting up environment...")
+                success = self.setup_controller.setup(self.config, task_config.get("proxy", False) and self.enable_proxy)
+                if success:
+                    # Mark environment as used when setup is successfully executed
+                    if self.config:  # Only mark as used if there were actual setup operations
+                        self.is_environment_used = True
+                    break
+                else:
+                    logger.error(
+                        "Environment setup failed, retrying (%d/%d)...",
+                        attempt + 1,
+                        MAX_RETRIES,
+                    )
+                    time.sleep(5)
+            else:
+                break
+            
+        logger.info("Environment setup complete.")
 
-        time.sleep(5)
+        time.sleep(sleep_time)
+
         observation = self._get_obs()
         return observation
 
-    def reset_docker_remote_fc(self, task_config: Optional[Dict[str, Any]] = None, seed=None, options=None) -> Dict[str, Any]:
-        # Reset to certain task in OSWorld
-        logger.info("Resetting environment...")
+    def reset_docker_remote_fc(self, task_config: Optional[Dict[str, Any]] = None, sleep_time=10) -> Dict[str, Any]:
+        logger.info("Resetting environment (docker_remote_fc)...")
         logger.info("Switching task...")
         logger.info("Setting counters...")
         self._traj_no += 1
         self._step_no = 0
         self.action_history.clear()
 
-        logger.info("Reverting to snapshot to {}...".format(self.snapshot_name))
-        self._revert_to_snapshot()
-        logger.info("Starting emulator...")
-        self._start_emulator_docker_remote_fc()
-        logger.info("Emulator started.")
+        for attempt in range(MAX_RETRIES):
+            logger.info("Reverting to snapshot %s...", self.snapshot_name)
+            self._revert_to_snapshot()
+            logger.info("Starting emulator...")
+            self._start_emulator_docker_remote_fc()
+            logger.info("Emulator started.")
 
-        if task_config is not None:
-            self._set_task_info(task_config)
-            self.setup_controller.reset_cache_dir(self.cache_dir)
-            logger.info("Setting up environment...")
-            self.setup_controller.setup(self.config)
-            logger.info("Environment setup complete.")
+            if task_config is not None:
+                task_use_proxy = task_config.get("proxy", False) and self.enable_proxy
+                if not self.enable_proxy and task_config.get("proxy", False):
+                    logger.info("Task requires proxy but proxy is disabled at system level, ignoring proxy requirement.")
+                if task_use_proxy != self.current_use_proxy:
+                    self.current_use_proxy = task_use_proxy
 
+                self._set_task_info(task_config)
+                self.setup_controller.reset_cache_dir(self.cache_dir)
+                self.controller.set_vm_screen_size(self.screen_width, self.screen_height)
+                if task_use_proxy:
+                    self.setup_controller._proxy_setup(self.client_password)
+                success = self.setup_controller.setup(self.config, task_use_proxy)
+                if success:
+                    if self.config:
+                        self.is_environment_used = True
+                    break
+                logger.error(
+                    "Environment setup failed, retrying (%d/%d)...",
+                    attempt + 1,
+                    MAX_RETRIES,
+                )
+                time.sleep(5)
+            else:
+                break
+
+        logger.info("Environment setup complete.")
+        time.sleep(sleep_time)
         observation = self._get_obs()
         return observation
-    
-    def reset_docker_remote_fc_v1(self, task_config: Optional[Dict[str, Any]] = None, seed=None, options=None) -> Dict[str, Any]:
-        # Reset to certain task in OSWorld
-        logger.info("Resetting environment...")
+
+    def reset_docker_remote_fc_v1(self, task_config: Optional[Dict[str, Any]] = None, sleep_time=10) -> Dict[str, Any]:
+        logger.info("Resetting environment (docker_remote_fc_v1)...")
         logger.info("Switching task...")
         logger.info("Setting counters...")
         self._traj_no += 1
         self._step_no = 0
         self.action_history.clear()
 
-        logger.info("Reverting to snapshot to {} by directly restarting the container {}...".format(self.snapshot_name, self.container_name))
+        logger.info("Reverting to snapshot %s by restarting container %s...", self.snapshot_name, self.container_name)
         self._revert_to_snapshot()
-        logger.info("Emulator started.")
+        logger.info("Snapshot revert completed.")
 
         if task_config is not None:
+            task_use_proxy = task_config.get("proxy", False) and self.enable_proxy
+            if not self.enable_proxy and task_config.get("proxy", False):
+                logger.info("Task requires proxy but proxy is disabled at system level, ignoring proxy requirement.")
+            if task_use_proxy != self.current_use_proxy:
+                self.current_use_proxy = task_use_proxy
+
             self._set_task_info(task_config)
             self.setup_controller.reset_cache_dir(self.cache_dir)
-            logger.info("Setting up environment...")
-            self.setup_controller.setup(self.config)
-            logger.info("Environment setup complete.")
+            self.controller.set_vm_screen_size(self.screen_width, self.screen_height)
+            if task_use_proxy:
+                self.setup_controller._proxy_setup(self.client_password)
+            success = self.setup_controller.setup(self.config, task_use_proxy)
+            if success and self.config:
+                self.is_environment_used = True
+            elif not success:
+                logger.error("Environment setup failed for docker_remote_fc_v1.")
+        else:
+            self.is_environment_used = False
 
+        logger.info("Environment setup complete.")
+        time.sleep(sleep_time)
         observation = self._get_obs()
         return observation
 
@@ -278,12 +516,17 @@ class DesktopEnv(gym.Env):
         return self.controller.get_vm_screen_size()
 
     def _set_task_info(self, task_config: Dict[str, Any]):
+        """Set task info (proxy logic is handled in reset method)"""
         self.task_id: str = task_config["id"]
         self.cache_dir: str = os.path.join(self.cache_dir_base, self.task_id)
         os.makedirs(self.cache_dir, exist_ok=True)
         self.instruction = task_config["instruction"]
         self.config = task_config["config"] if "config" in task_config else []
+        
+        self._set_evaluator_info(task_config)
 
+    def _set_evaluator_info(self, task_config: Dict[str, Any]):
+        """Set evaluator information from task config"""
         # evaluator dict
         # func -> metric function string, or list of metric function strings
         # conj -> conjunction of multiple metrics if func is a list with length > 1, "and"/"or"
@@ -329,14 +572,17 @@ class DesktopEnv(gym.Env):
                 or (len(self.metric) == len(self.result_getter) == len(self.expected_getter) == len(
                     self.metric_options)))
 
-    def step(self, action, pause=1, replay_pause=None):
+    def step(self, action, pause=2, replay_pause=None):
         self._step_no += 1
         self.action_history.append(action)
+        
+        # Mark environment as used when step is called
+        self.is_environment_used = True
 
         reward = 0  # todo: Define reward calculation for each example
         done = False  # todo: Define episode termination condition for each example
         info = {}
-
+        logger.info(f"Step {self._step_no} in trajectory {self._traj_no} with action: {action}")
         # handle the special actions
         if action in ['WAIT', 'FAIL', 'DONE'] or (type(action) == dict and action['action_type'] in ['WAIT', 'FAIL', 'DONE']):
             if action == 'WAIT':
@@ -351,18 +597,24 @@ class DesktopEnv(gym.Env):
         if self.action_space == "computer_13":
             # the set of all possible actions defined in the action representation
             self.controller.execute_action(action)
-        elif self.action_space == "pyautogui":
+        elif self.action_space in {"pyautogui", "claude_computer_use", "autoglm_computer_use"}:
             if action in ['WAIT', 'FAIL', 'DONE']:
                 self.controller.execute_action(action)
             else:
                 # the set of all possible python commands insides `pyautogui`
-                self.controller.execute_gui_command(action)
+                if type(action) == str:
+                    # Fix PyAutoGUI '<' character bug before execution
+                    fixed_command = _fix_pyautogui_less_than_bug(action)
+                    self.controller.execute_python_command(fixed_command)
+                elif type(action) == dict:
+                    # Fix PyAutoGUI '<' character bug before execution
+                    fixed_command = _fix_pyautogui_less_than_bug(action['command'])
+                    self.controller.execute_python_command(fixed_command)
 
         if replay_pause is not None:
             time.sleep(replay_pause)
         else:
             time.sleep(pause)
-
         observation = self._get_obs()
 
         return observation, reward, done, info
@@ -372,20 +624,27 @@ class DesktopEnv(gym.Env):
         Evaluate whether the task is successfully completed.
         """
 
-        self.setup_controller.setup(self.evaluator.get("postconfig", []))
+        postconfig = self.evaluator.get("postconfig", [])
+        self.setup_controller.setup(postconfig, self.enable_proxy)
+        # Mark environment as used if there were postconfig setup operations
+        if postconfig:
+            self.is_environment_used = True
 
         if self.evaluator['func'] == "infeasible":
             if len(self.action_history) > 0 and self.action_history[-1] == "FAIL":
-                return 1, "INFEASIBLE"
+                return 1
             else:
-                return 0, "INFEASIBLE"
+                return 0
         else:
             if len(self.action_history) > 0 and self.action_history[-1] == "FAIL":
-                return 0, "FAIL"
+                return 0
 
         if type(self.metric) == list:
+            # Multiple metrics to evaluate whether the task is successfully completed
             results = []
-            reasons = []
+            assert len(self.metric) == len(self.result_getter), "The number of metrics and result getters must be the same"
+            if "expected" in self.evaluator:
+                assert len(self.metric) == len(self.expected_getter), "The number of metrics and expected getters must be the same"
             for idx, metric in enumerate(self.metric):
                 try:
                     config = self.evaluator["result"][idx]
@@ -393,38 +652,37 @@ class DesktopEnv(gym.Env):
                 except FileNotFoundError:
                     logger.error("File not found!")
                     if self.metric_conj == 'and':
-                        return 0, "File not found!"
+                        return 0
 
-                expected = self.evaluator["expected"][idx]
-                expected_state = self.expected_getter[idx](self, expected) if expected else None
-
-                metric, reason = metric(result_state, expected_state,
-                                     **self.metric_options[idx]) if expected_state is not None \
-                    else metric(result_state, **self.metric_options[idx])
+                if "expected" in self.evaluator and self.expected_getter and self.evaluator["expected"]:
+                    expected_state = self.expected_getter[idx](self, self.evaluator["expected"][idx])
+                    metric: int = metric(result_state, expected_state, **self.metric_options[idx])
+                else:
+                    metric: int = metric(result_state, **self.metric_options[idx])
 
                 if self.metric_conj == 'and' and float(metric) == 0.0:
-                    return 0, reason
+                    return 0
                 elif self.metric_conj == 'or' and float(metric) == 1.0:
-                    return 1, "SUCCESS"
+                    return 1
                 else:
                     results.append(metric)
-                    reasons.append(reason)
-            return sum(results) / len(results) if self.metric_conj == 'and' else max(results), "; ".join(reasons)
+
+            return sum(results) / len(results) if self.metric_conj == 'and' else max(results)
         else:
+            # Single metric to evaluate whether the task is successfully completed
             try:
                 result_state = self.result_getter(self, self.evaluator["result"])
             except FileNotFoundError:
                 logger.error("File not found!")
-                return 0, "File not found!"
+                return 0
 
-            expected_state = self.expected_getter(self, self.evaluator["expected"]) if "expected" in self.evaluator \
-                else None
+            if "expected" in self.evaluator and self.expected_getter and self.evaluator["expected"]:
+                expected_state = self.expected_getter(self, self.evaluator["expected"])
+                metric: float = self.metric(result_state, expected_state, **self.metric_options)
+            else:
+                metric: float = self.metric(result_state, **self.metric_options)
 
-            metric, reason = self.metric(result_state, expected_state,
-                                        **self.metric_options) if expected_state is not None \
-                else self.metric(result_state, **self.metric_options)
-
-            return metric, reason
+        return metric
 
     def render(self, mode='rgb_array'):
         if mode == 'rgb_array':

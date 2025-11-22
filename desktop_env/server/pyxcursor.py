@@ -78,6 +78,28 @@ class Xcursor:
         if not self.display:
             self.display = self.xlib.XOpenDisplay(display)  # (display) or (None)
 
+    def close(self):
+        """Close the underlying X11 display handle to avoid leaking X clients."""
+        if self.display is not None:
+            try:
+                # Define signature once before calling
+                XCloseDisplay = self.xlib.XCloseDisplay
+                XCloseDisplay.restype = None
+                XCloseDisplay.argtypes = [ctypes.POINTER(Display)]
+                XCloseDisplay(self.display)
+            except Exception:
+                # Best-effort cleanup; ignore close errors
+                pass
+            finally:
+                self.display = None
+
+    def __del__(self):
+        # Best-effort ensure display connection is closed
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def argbdata_to_pixdata(self, data, len):
         if data == None or len < 1: return None
 

@@ -1,40 +1,26 @@
-import contextlib
 import ctypes
-import datetime
-import json
-import math
 import os
 import platform
 import shlex
-import code
-import io
-import traceback
+import json
 import subprocess, signal
-from pathlib import Path
-import threading
-from threading import Lock
+import tempfile
 import time
+from pathlib import Path
+import traceback
 from typing import Any, Optional, Sequence
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Literal
 import concurrent.futures
 
 import Xlib
 import lxml.etree
 import pyautogui
-try:
-    import pyperclip
-except ImportError:                      # library not installed
-    pyperclip = None
 import requests
 import re
 from PIL import Image, ImageGrab
 from Xlib import display, X
-from flask import Flask, request, jsonify, send_file, abort
+from flask import Flask, request, jsonify, send_file, abort  # , send_from_directory
 from lxml.etree import _Element
-
-from werkzeug.utils import secure_filename
-
-
 
 platform_name: str = platform.system()
 
@@ -77,383 +63,16 @@ from pyxcursor import Xcursor
 
 # todo: need to reformat and organize this whole file
 
-# ↓ new, optional third-party helpers (add to requirements.txt):
-from pynput import keyboard, mouse          # cross-platform hooks
-
-# trajectory-recording state
-trajectory_lock      = threading.Lock()
-trajectory_is_alive  = False
-trajectory_events: list[dict] = []
-trajectory_thread    = None
-trajectory_file_path = None        # will hold "…/trajectory_YYYYmmdd_HHMMSS.json"
-DOUBLE_CLICK_MS   = 350            # two left clicks ≤ this Δt → LeftDouble
-DRAG_MIN_PX       = 15              # press→release disp ≥ this → Drag
-TYPE_FLUSH_MS     = 400            # pause ≥ this → flush typing buffer
-
-# mouse
-last_down          = {}            # {button: (t, x, y)}
-last_left_click    = (0, None)     # (t, (x,y))
-move_since_down    = {}
-
-# keyboard
-pressed_now        = set()         # live modifiers / chars
-combo_buffer       = set()         # what's been in the combo so far
-type_buffer        = []            # accumulating printable chars
-last_type_ts       = 0.0
-
-WORD_DELIMS       = {" ", "\t", "\n", "\r"}
-WORD_CHARS        = set("abcdefghijklmnopqrstuvwxyz"
-                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                        "0123456789-'")
-word_buffer       = []          # accumulating characters of the current word
-last_word_ts      = 0.0
-# recognise space/enter/tab explicitly (pynput sends them as Key.xxx)
-DELIM_KEYS        = [
-    keyboard.Key.enter,
-    keyboard.Key.tab,
-    keyboard.Key.space,
-]
-
-# ───────── replay state ─────────
-replay_is_alive   = False
-replay_thread     = None
-MOUSE_CTRL        = mouse.Controller()
-KEY_CTRL          = keyboard.Controller()
-KEY_MAP           = {                 # minimal map for special names we emit
-    "ctrl":  keyboard.Key.ctrl,
-    "alt":   keyboard.Key.alt,
-    "shift": keyboard.Key.shift,
-    "cmd":   keyboard.Key.cmd,
-    "enter": keyboard.Key.enter,
-    "tab":   keyboard.Key.tab,
-    "esc":   keyboard.Key.esc,
-    "space": keyboard.Key.space,
-    "backspace": keyboard.Key.backspace,
-}
-
-# clipboard
-clipboard_cache    = None
-clipboard_enabled = pyperclip is not None
-
 app = Flask(__name__)
 
 pyautogui.PAUSE = 0
 pyautogui.DARWIN_CATCH_UP_TIME = 0
 
+TIMEOUT = 1800  # seconds
+
 logger = app.logger
 recording_process = None  # fixme: this is a temporary solution for recording, need to be changed to support multiple-process
 recording_path = "/tmp/recording.mp4"
-
-
-console = code.InteractiveConsole(locals={})
-console_lock = Lock()
-
-
-def _safe_clipboard_paste() -> str | None:
-    """Return clipboard text or None; never raises."""
-    if pyperclip is None:
-        return None
-    with contextlib.suppress(Exception):     # PyperclipException etc.
-        return pyperclip.paste()
-    return None
-
-def _flush_word_buffer(ts_end: float | None = None):
-    """Emit a word-level Type() and clear the buffer."""
-    global word_buffer
-    if word_buffer:
-        _append_event("Type", {"word": "".join(word_buffer)}, ts=ts_end)
-        word_buffer.clear()
-
-def _append_event(op: str, payload: dict, ts: float | None = None):
-    with trajectory_lock:
-        if trajectory_is_alive:
-            event = {"ts": ts or time.time(), "op": op}
-            event.update(payload)
-            trajectory_events.append(event)
-
-def _dist(p1, p2):
-    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
-
-def on_click(x, y, button, pressed):
-    global last_left_click
-    now = time.time()
-
-    # ───── press ─────
-    if pressed:
-        last_down[button] = (now, x, y)
-        move_since_down[button] = False
-        return
-
-    # ───── release ─────
-    down_t, x0, y0 = last_down.pop(button, (now, x, y))
-    moved          = move_since_down.pop(button, False)
-    dt_ms          = (now - down_t) * 1000
-
-    # Drag?
-    if moved and _dist((x0, y0), (x, y)) >= DRAG_MIN_PX:
-        _append_event("Drag", {"x1": x0, "y1": y0, "x2": x, "y2": y}, ts=now)
-        return
-
-    # Click variants
-    if button.name == "left":
-        # Double-click?
-        last_t, last_xy = last_left_click
-        if last_xy and _dist(last_xy, (x, y)) < DRAG_MIN_PX and (now - last_t) * 1000 <= DOUBLE_CLICK_MS:
-            _append_event("LeftDouble", {"x": x, "y": y}, ts=now)
-            last_left_click = (0, None)          # reset
-        else:
-            _append_event("Click", {"x": x, "y": y}, ts=now)
-            last_left_click = (now, (x, y))
-    elif button.name == "right":
-        _append_event("RightSingle", {"x": x, "y": y}, ts=now)
-
-def on_move(x, y):
-    global move_since_down
-    # mark drag candidate
-    for btn in move_since_down:
-        move_since_down[btn] = True
-
-def on_scroll(x, y, dx, dy):
-    direc = "down" if dy < 0 else "up"
-    _append_event("Scroll", {"x": x, "y": y, "direction": direc})
-
-def on_key_press(k):
-    global last_word_ts
-    now = time.time()
-    key_str = str(k).strip("'")        # pynput → "'a'"  →  a
-
-    pressed_now.add(key_str)
-    combo_buffer.add(key_str)
-
-    # ------------------------------------------------------------
-    # 1)  word delimiters  (space / enter / tab)
-    # ------------------------------------------------------------
-    if k in DELIM_KEYS:
-        _append_event("Hotkey", {"key": key_str}, ts=now)  # record delimiter
-        _flush_word_buffer(ts_end=now)
-        last_word_ts = now
-        return
-
-    # ------------------------------------------------------------
-    # 2) printable, single-character keycode  (letters, digits, etc.)
-    # ------------------------------------------------------------
-    if len(key_str) == 1 and key_str.isprintable():
-        if key_str in WORD_DELIMS:
-            _flush_word_buffer(ts_end=now)
-        elif key_str in WORD_CHARS:
-            word_buffer.append(key_str)
-            last_word_ts = now
-        else:                          # punctuation "." "," "?"
-            _flush_word_buffer(ts_end=now)
-            _append_event("Type", {"word": key_str}, ts=now)
-        return
-
-def on_key_release(k):
-    global last_word_ts
-    now = time.time()
-    key_str = str(k).strip("'")
-    pressed_now.discard(key_str)
-
-    # If all keys are up and the user paused, flush any unfinished word
-    if not pressed_now and (now - last_word_ts) * 1000 > TYPE_FLUSH_MS:
-        _flush_word_buffer(ts_end=now)
-
-    # end of combo?
-    if not pressed_now and combo_buffer:
-        keys = sorted(combo_buffer)
-        combo_buffer.clear()
-
-        # single special ⇒ Hotkey
-        if len(keys) == 1:
-            _append_event("Hotkey", {"key": keys[0]}, ts=now)
-        else:
-            clip_delta = None
-            if clipboard_enabled:
-                clip_now = _safe_clipboard_paste()
-                global clipboard_cache
-                if clipboard_cache is None:
-                    clipboard_cache = clip_now          # first run
-                elif clip_now != clipboard_cache:
-                    # something changed after the combo
-                    clip_delta = clip_now if clip_now else "image"
-                    clipboard_cache = clip_now
-
-            payload = {"keys": keys}
-            if clip_delta is not None:
-                payload["clipboard"] = clip_delta
-
-            _append_event("CombKey", payload, ts=now)
-
-
-def _run_pynput_listener():
-    """
-    Background daemon that pumps keyboard + mouse events into the
-    high-level logger.  Exits cleanly when `trajectory_is_alive` flips
-    to False.
-    """
-    if keyboard is None or mouse is None:
-        raise RuntimeError("Please `pip install pynput` inside the VM.")
-
-    # ── build the two listeners ───────────────────────────────────────
-    kb_listener = keyboard.Listener(
-        on_press=on_key_press,
-        on_release=on_key_release,
-        suppress=False          # never block OS behaviour
-    )
-    ms_listener = mouse.Listener(
-        on_click=on_click,
-        on_move=on_move,
-        on_scroll=on_scroll,    # ← you *must* wire this in too
-        suppress=False
-    )
-
-    # ── fire them up ──────────────────────────────────────────────────
-    kb_listener.start()
-    ms_listener.start()
-
-    # ── stay alive until `/end_trajectory` toggles the flag ───────────
-    try:
-        while trajectory_is_alive and (
-              kb_listener.is_alive() and ms_listener.is_alive()):
-            time.sleep(0.05)
-    finally:
-        kb_listener.stop()
-        ms_listener.stop()
-        kb_listener.join(1)
-        ms_listener.join(1)
-
-
-@app.route('/start_trajectory', methods=['POST'])
-def start_trajectory():
-    global trajectory_is_alive, trajectory_thread, trajectory_events, trajectory_file_path
-
-    if trajectory_is_alive:
-        return jsonify({"status": "error", "msg": "Trajectory recording already running"}), 400
-
-    # reset state
-    with trajectory_lock:
-        trajectory_events.clear()
-    trajectory_is_alive  = True
-    trajectory_file_path = f"/tmp/trajectory_{datetime.datetime.now():%Y%m%d_%H%M%S}.json"
-
-    # fire-and-forget background listener
-    trajectory_thread = threading.Thread(target=_run_pynput_listener, daemon=True)
-    trajectory_thread.start()
-
-    return jsonify({"status": "success", "msg": "Trajectory recording started"})
-
-
-@app.route('/end_trajectory', methods=['POST'])
-def end_trajectory():
-    global trajectory_is_alive, trajectory_thread, trajectory_file_path
-
-    if not trajectory_is_alive:
-        return jsonify({"status": "error", "msg": "No active trajectory recording"}), 400
-
-    # flip the flag → listener thread exits its loop gracefully
-    trajectory_is_alive = False
-    trajectory_thread.join(timeout=2)
-    _flush_word_buffer()
-
-    return jsonify({"status": "success", "msg": "Trajectory recording started", "trajectories": trajectory_events})
-
-
-def _clean_key(key_str: str) -> str:
-    """
-    Cleans pynput key names for pyautogui.
-    e.g. "Key.ctrl" -> "ctrl"
-    """
-    return key_str.strip("'").replace('Key.', '')
-
-
-def _replay_trajectory_events(events: list[dict]):
-    """
-    Takes a recorded trajectory and simulates the user inputs.
-    Blocks until all events have been replayed.
-    """
-    logs = []
-    if not events:
-        return logs
-
-    # sort by timestamp and prepare for timed replay
-    events.sort(key=lambda e: e['ts'])
-    start_time = time.time()
-    start_ts = events[0]['ts']
-    logs.append(f"Starting trajectory replay. Events: {len(events)}")
-
-    for i, event in enumerate(events):
-        # sync with wall-clock time
-        target_time = start_time + (event['ts'] - start_ts)
-        sleep_for = target_time - time.time()
-        if sleep_for > 0:
-            time.sleep(sleep_for)
-
-        # execute action
-        op = event['op']
-        logs.append(f"Executing event {i+1}/{len(events)}: {op} with params {event}")
-        if op == "Click":
-            pyautogui.click(x=event['x'], y=event['y'])
-        elif op == "LeftDouble":
-            pyautogui.doubleClick(x=event['x'], y=event['y'])
-        elif op == "RightSingle":
-            pyautogui.rightClick(x=event['x'], y=event['y'])
-        elif op == "Drag":
-            pyautogui.moveTo(event['x1'], event['y1'], _pause=False)
-            pyautogui.dragTo(event['x2'], event['y2'], duration=0.5, button='left', _pause=False)
-        elif op == "Scroll":
-            # scroll amount is in "clicks" - arbitrary unit
-            scroll_dist = 120 if event['direction'] == 'up' else -120
-            pyautogui.scroll(scroll_dist, x=event['x'], y=event['y'])
-        # elif op == "Type":
-        #     # interval between chars makes it feel more real
-        #     pyautogui.write(event['word'], interval=0.01)
-        elif op == "Hotkey":
-            pyautogui.press(_clean_key(event['key']))
-        elif op == "CombKey":
-            clean_keys = [_clean_key(k) for k in event['keys']]
-            pyautogui.hotkey(*clean_keys)
-        elif op == "Command":
-            result = subprocess.run(
-                event["command"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
-                text=True,
-                timeout=3,
-                creationflags=0,
-            )
-            logs.append(f"Command executed. stdout: {result.stdout}, stderr: {result.stderr}")
-    logs.append("Trajectory replay finished.")
-    return logs
-
-
-@app.route('/play_trajectory', methods=['POST'])
-def play_trajectory():
-    if 'file' not in request.files:
-        return jsonify({"status": "error", "msg": "No trajectory file part"}), 400
-    
-    file = request.files['file']
-    if not file or not file.filename:
-        return jsonify({"status": "error", "msg": "No selected trajectory file"}), 400
-
-    try:
-        # content is bytes, decode to string, then parse
-        content = file.read().decode('utf-8')
-        events = json.loads(content)
-        
-        logs = _replay_trajectory_events(events) # This will block
-        
-        return jsonify({"status": "success", "msg": "Trajectory replayed", "log": logs})
-    except Exception as e:
-        logger.error(f"Error replaying trajectory: {e}")
-        return jsonify({"status": "error", "msg": f"Error replaying trajectory: {e}"}), 500
-
-
-@app.route('/stop_replay', methods=['POST'])
-def stop_replay():
-    global replay_is_alive
-    replay_is_alive = False
-    return jsonify({"status": "success", "msg": "replay stopped"})
 
 
 @app.route('/setup/execute', methods=['POST'])
@@ -463,18 +82,14 @@ def execute_command():
     # The 'command' key in the JSON request should contain the command to be executed.
     shell = data.get('shell', False)
     command = data.get('command', "" if shell else [])
-    
-    # Handle single command (preserve existing behavior)
+
     if isinstance(command, str) and not shell:
         command = shlex.split(command)
 
     # Expand user directory
-    if isinstance(command, list):
-        for i, arg in enumerate(command):
-            if arg.startswith("~/"):
-                command[i] = os.path.expanduser(arg)
-    else:
-        command = os.path.expanduser(command) if command.startswith("~/") else command
+    for i, arg in enumerate(command):
+        if arg.startswith("~/"):
+            command[i] = os.path.expanduser(arg)
 
     # Execute the command without any safety checks.
     try:
@@ -488,20 +103,122 @@ def execute_command():
             stderr=subprocess.PIPE,
             shell=shell,
             text=True,
-            timeout=3,
+            timeout=120,
             creationflags=flags,
         )
-        if "pyautogui" not in str(command):
-            _append_event("Command", 
-                          {"command": command, "output": result.stdout, "error": result.stderr, "returncode": result.returncode}, 
-                          ts=time.time())
-
         return jsonify({
             'status': 'success',
             'output': result.stdout,
             'error': result.stderr,
             'returncode': result.returncode
         })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/setup/execute_with_verification', methods=['POST'])
+@app.route('/execute_with_verification', methods=['POST'])
+def execute_command_with_verification():
+    """Execute command and verify the result based on provided verification criteria"""
+    data = request.json
+    shell = data.get('shell', False)
+    command = data.get('command', "" if shell else [])
+    verification = data.get('verification', {})
+    max_wait_time = data.get('max_wait_time', 10)  # Maximum wait time in seconds
+    check_interval = data.get('check_interval', 1)  # Check interval in seconds
+
+    if isinstance(command, str) and not shell:
+        command = shlex.split(command)
+
+    # Expand user directory
+    for i, arg in enumerate(command):
+        if arg.startswith("~/"):
+            command[i] = os.path.expanduser(arg)
+
+    # Execute the main command
+    try:
+        if platform_name == "Windows":
+            flags = subprocess.CREATE_NO_WINDOW
+        else:
+            flags = 0
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=shell,
+            text=True,
+            timeout=120,
+            creationflags=flags,
+        )
+        
+        # If no verification is needed, return immediately
+        if not verification:
+            return jsonify({
+                'status': 'success',
+                'output': result.stdout,
+                'error': result.stderr,
+                'returncode': result.returncode
+            })
+        
+        # Wait and verify the result
+        import time
+        start_time = time.time()
+        while time.time() - start_time < max_wait_time:
+            verification_passed = True
+            
+            # Check window existence if specified
+            if 'window_exists' in verification:
+                window_name = verification['window_exists']
+                try:
+                    if platform_name == 'Linux':
+                        wmctrl_result = subprocess.run(['wmctrl', '-l'], 
+                                                     capture_output=True, text=True, check=True)
+                        if window_name.lower() not in wmctrl_result.stdout.lower():
+                            verification_passed = False
+                    elif platform_name in ['Windows', 'Darwin']:
+                        import pygetwindow as gw
+                        windows = gw.getWindowsWithTitle(window_name)
+                        if not windows:
+                            verification_passed = False
+                except Exception:
+                    verification_passed = False
+            
+            # Check command execution if specified
+            if 'command_success' in verification:
+                verify_cmd = verification['command_success']
+                try:
+                    verify_result = subprocess.run(verify_cmd, shell=True, 
+                                                 capture_output=True, text=True, timeout=5)
+                    if verify_result.returncode != 0:
+                        verification_passed = False
+                except Exception:
+                    verification_passed = False
+            
+            if verification_passed:
+                return jsonify({
+                    'status': 'success',
+                    'output': result.stdout,
+                    'error': result.stderr,
+                    'returncode': result.returncode,
+                    'verification': 'passed',
+                    'wait_time': time.time() - start_time
+                })
+            
+            time.sleep(check_interval)
+        
+        # Verification failed
+        return jsonify({
+            'status': 'verification_failed',
+            'output': result.stdout,
+            'error': result.stderr,
+            'returncode': result.returncode,
+            'verification': 'failed',
+            'wait_time': max_wait_time
+        }), 500
+        
     except Exception as e:
         return jsonify({
             'status': 'error',
@@ -597,14 +314,20 @@ def capture_screen_with_cursor():
             pos = (round(pos_win[0]*ratio - hotspotx), round(pos_win[1]*ratio - hotspoty))
 
             img.paste(cursor, pos, cursor)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to capture cursor on Windows, screenshot will not have a cursor. Error: {e}")
 
         img.save(file_path)
     elif user_platform == "Linux":
         cursor_obj = Xcursor()
-        imgarray = cursor_obj.getCursorImageArrayFast()
-        cursor_img = Image.fromarray(imgarray)
+        try:
+            imgarray = cursor_obj.getCursorImageArrayFast()
+            cursor_img = Image.fromarray(imgarray)
+        finally:
+            try:
+                cursor_obj.close()
+            except Exception:
+                pass
         screenshot = pyautogui.screenshot()
         cursor_x, cursor_y = pyautogui.position()
         screenshot.paste(cursor_img, (cursor_x, cursor_y), cursor_img)
@@ -1253,8 +976,14 @@ def get_accessibility_tree():
 def get_screen_size():
     if platform_name == "Linux":
         d = display.Display()
-        screen_width = d.screen().width_in_pixels
-        screen_height = d.screen().height_in_pixels
+        try:
+            screen_width = d.screen().width_in_pixels
+            screen_height = d.screen().height_in_pixels
+        finally:
+            try:
+                d.close()
+            except Exception:
+                pass
     elif platform_name == "Windows":
         user32 = ctypes.windll.user32
         screen_width: int = user32.GetSystemMetrics(0)
@@ -1275,27 +1004,33 @@ def get_window_size():
         return jsonify({"error": "app_class_name is required"}), 400
 
     d = display.Display()
-    root = d.screen().root
-    window_ids = root.get_full_property(d.intern_atom('_NET_CLIENT_LIST'), X.AnyPropertyType).value
+    try:
+        root = d.screen().root
+        window_ids = root.get_full_property(d.intern_atom('_NET_CLIENT_LIST'), X.AnyPropertyType).value
 
-    for window_id in window_ids:
-        try:
-            window = d.create_resource_object('window', window_id)
-            wm_class = window.get_wm_class()
+        for window_id in window_ids:
+            try:
+                window = d.create_resource_object('window', window_id)
+                wm_class = window.get_wm_class()
 
-            if wm_class is None:
+                if wm_class is None:
+                    continue
+
+                if app_class_name.lower() in [name.lower() for name in wm_class]:
+                    geom = window.get_geometry()
+                    return jsonify(
+                        {
+                            "width": geom.width,
+                            "height": geom.height
+                        }
+                    )
+            except Xlib.error.XError:  # Ignore windows that give an error
                 continue
-
-            if app_class_name.lower() in [name.lower() for name in wm_class]:
-                geom = window.get_geometry()
-                return jsonify(
-                    {
-                        "width": geom.width,
-                        "height": geom.height
-                    }
-                )
-        except Xlib.error.XError:  # Ignore windows that give an error
-            continue
+    finally:
+        try:
+            d.close()
+        except Exception:
+            pass
     return None
 
 
@@ -1420,11 +1155,21 @@ def get_file():
         return jsonify({"error": "file_path is required"}), 400
 
     try:
+        # Check if the file exists and get its size
+        if not os.path.exists(file_path):
+            return jsonify({"error": "File not found"}), 404
+        
+        file_size = os.path.getsize(file_path)
+        logger.info(f"Serving file: {file_path} ({file_size} bytes)")
+        
         # Check if the file exists and send it to the user
         return send_file(file_path, as_attachment=True)
     except FileNotFoundError:
         # If the file is not found, return a 404 error
         return jsonify({"error": "File not found"}), 404
+    except Exception as e:
+        logger.error(f"Error serving file {file_path}: {e}")
+        return jsonify({"error": f"Failed to serve file: {str(e)}"}), 500
 
 
 @app.route("/setup/upload", methods=["POST"])
@@ -1433,8 +1178,29 @@ def upload_file():
     if 'file_path' in request.form and 'file_data' in request.files:
         file_path = os.path.expandvars(os.path.expanduser(request.form['file_path']))
         file = request.files["file_data"]
-        file.save(file_path)
-        return "File Uploaded"
+        
+        try:
+            # Ensure target directory exists
+            target_dir = os.path.dirname(file_path)
+            if target_dir:  # Only create directory if it's not empty
+                os.makedirs(target_dir, exist_ok=True)
+            
+            # Save file and get size for verification
+            file.save(file_path)
+            uploaded_size = os.path.getsize(file_path)
+            
+            logger.info(f"File uploaded successfully: {file_path} ({uploaded_size} bytes)")
+            return f"File Uploaded: {uploaded_size} bytes"
+            
+        except Exception as e:
+            logger.error(f"Error uploading file to {file_path}: {e}")
+            # Clean up partial file if it exists
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+            return jsonify({"error": f"Failed to upload file: {str(e)}"}), 500
     else:
         return jsonify({"error": "file_path and file_data are required"}), 400
 
@@ -1493,20 +1259,45 @@ def download_file():
 
     max_retries = 3
     error: Optional[Exception] = None
+    
     for i in range(max_retries):
         try:
-            response = requests.get(url, stream=True)
+            logger.info(f"Download attempt {i+1}/{max_retries} for {url}")
+            response = requests.get(url, stream=True, timeout=300)
             response.raise_for_status()
+            
+            # Get expected file size if available
+            total_size = int(response.headers.get('content-length', 0))
+            if total_size > 0:
+                logger.info(f"Expected file size: {total_size / (1024*1024):.2f} MB")
 
+            downloaded_size = 0
             with open(path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-            return "File downloaded successfully"
+                        downloaded_size += len(chunk)
+                        if total_size > 0 and downloaded_size % (1024*1024) == 0:  # Log every MB
+                            progress = (downloaded_size / total_size) * 100
+                            logger.info(f"Download progress: {progress:.1f}%")
+            
+            # Verify download completeness
+            actual_size = os.path.getsize(path)
+            if total_size > 0 and actual_size != total_size:
+                raise Exception(f"Download incomplete. Expected {total_size} bytes, got {actual_size} bytes")
+            
+            logger.info(f"File downloaded successfully: {path} ({actual_size} bytes)")
+            return f"File downloaded successfully: {actual_size} bytes"
 
-        except requests.RequestException as e:
+        except (requests.RequestException, Exception) as e:
             error = e
-            logger.error(f"Failed to download {url}. Retrying... ({max_retries - i - 1} attempts left)")
+            logger.error(f"Failed to download {url}: {e}. Retrying... ({max_retries - i - 1} attempts left)")
+            # Clean up partial download
+            if path.exists():
+                try:
+                    path.unlink()
+                except:
+                    pass
 
     return f"Failed to download {url}. No retries left. Error: {error}", 500
 
@@ -1519,18 +1310,88 @@ def open_file():
     if not path:
         return "Path not supplied!", 400
 
-    path = Path(os.path.expandvars(os.path.expanduser(path)))
+    path_obj = Path(os.path.expandvars(os.path.expanduser(path)))
 
-    if not path.exists():
-        return f"File not found: {path}", 404
+    # Check if it's a file path that exists
+    is_file_path = path_obj.exists()
+    
+    # If it's not a file path, treat it as an application name/command
+    if not is_file_path:
+        # Check if it's a valid command by trying to find it in PATH
+        import shutil
+        if not shutil.which(path):
+            return f"Application/file not found: {path}", 404
 
     try:
-        if platform.system() == "Windows":
-            os.startfile(path)
+        if is_file_path:
+            # Handle file opening
+            if platform.system() == "Windows":
+                os.startfile(path_obj)
+            else:
+                open_cmd: str = "open" if platform.system() == "Darwin" else "xdg-open"
+                subprocess.Popen([open_cmd, str(path_obj)])
+            file_name = path_obj.name
+            file_name_without_ext, _ = os.path.splitext(file_name)
         else:
-            open_cmd: str = "open" if platform.system() == "Darwin" else "xdg-open"
-            subprocess.Popen([open_cmd, str(path)])
-        return "File opened successfully"
+            # Handle application launching
+            if platform.system() == "Windows":
+                subprocess.Popen([path])
+            else:
+                subprocess.Popen([path])
+            file_name = path
+            file_name_without_ext = path
+
+        # Wait for the file/application to open
+
+        start_time = time.time()
+        window_found = False
+
+        while time.time() - start_time < TIMEOUT:
+            os_name = platform.system()
+            if os_name in ['Windows', 'Darwin']:
+                import pygetwindow as gw
+                # Check for window title containing file name or file name without extension
+                windows = gw.getWindowsWithTitle(file_name)
+                if not windows:
+                    windows = gw.getWindowsWithTitle(file_name_without_ext)
+
+                if windows:
+                    # To be more specific, we can try to activate it
+                    windows[0].activate()
+                    window_found = True
+                    break
+            elif os_name == 'Linux':
+                try:
+                    # Using wmctrl to list windows and check if any window title contains the filename
+                    result = subprocess.run(['wmctrl', '-l'], capture_output=True, text=True, check=True)
+                    window_list = result.stdout.strip().split('\n')
+                    if not result.stdout.strip():
+                        pass  # No windows, just continue waiting
+                    else:
+                        for window in window_list:
+                            if file_name in window or file_name_without_ext in window:
+                                # a window is found, now activate it
+                                window_id = window.split()[0]
+                                subprocess.run(['wmctrl', '-i', '-a', window_id], check=True)
+                                window_found = True
+                                break
+                        if window_found:
+                            break
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    # wmctrl might not be installed or the window manager isn't ready.
+                    # We just log it once and let the main loop retry.
+                    if 'wmctrl_failed_once' not in locals():
+                        logger.warning("wmctrl command is not ready, will keep retrying...")
+                        wmctrl_failed_once = True
+                    pass  # Let the outer loop retry
+
+            time.sleep(1)
+
+        if window_found:
+            return "File opened and window activated successfully"
+        else:
+            return f"Failed to find window for {file_name} within {TIMEOUT} seconds.", 500
+
     except Exception as e:
         return f"Failed to open {path}. Error: {e}", 500
 
@@ -1653,275 +1514,360 @@ def close_window():
 @app.route('/start_recording', methods=['POST'])
 def start_recording():
     global recording_process
-    if recording_process:
+    if recording_process and recording_process.poll() is None:
         return jsonify({'status': 'error', 'message': 'Recording is already in progress.'}), 400
 
+    # Clean up previous recording if it exists
+    if os.path.exists(recording_path):
+        try:
+            os.remove(recording_path)
+        except OSError as e:
+            logger.error(f"Error removing old recording file: {e}")
+            return jsonify({'status': 'error', 'message': f'Failed to remove old recording file: {e}'}), 500
+
     d = display.Display()
-    screen_width = d.screen().width_in_pixels
-    screen_height = d.screen().height_in_pixels
+    try:
+        screen_width = d.screen().width_in_pixels
+        screen_height = d.screen().height_in_pixels
+    finally:
+        try:
+            d.close()
+        except Exception:
+            pass
 
     start_command = f"ffmpeg -y -f x11grab -draw_mouse 1 -s {screen_width}x{screen_height} -i :0.0 -c:v libx264 -r 30 {recording_path}"
 
-    recording_process = subprocess.Popen(shlex.split(start_command), stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL)
+    # Use stderr=PIPE to capture potential errors from ffmpeg
+    recording_process = subprocess.Popen(shlex.split(start_command),
+                                         stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.PIPE,
+                                         text=True  # To get stderr as string
+                                         )
 
-    return jsonify({'status': 'success', 'message': 'Started recording.'})
+    # Wait a couple of seconds to see if ffmpeg starts successfully
+    try:
+        # Wait for 2 seconds. If ffmpeg exits within this time, it's an error.
+        recording_process.wait(timeout=2)
+        # If wait() returns, it means the process has terminated.
+        error_output = recording_process.stderr.read()
+        return jsonify({
+            'status': 'error',
+            'message': f'Failed to start recording. ffmpeg terminated unexpectedly. Error: {error_output}'
+        }), 500
+    except subprocess.TimeoutExpired:
+        # This is the expected outcome: the process is still running after 2 seconds.
+        return jsonify({'status': 'success', 'message': 'Started recording successfully.'})
 
 
 @app.route('/end_recording', methods=['POST'])
 def end_recording():
     global recording_process
 
-    if not recording_process:
+    # If there's no active recording process, try to return an existing file if available.
+    if not recording_process or recording_process.poll() is not None:
+        recording_process = None  # Clean up stale process object
+        if os.path.exists(recording_path) and os.path.getsize(recording_path) > 0:
+            return send_file(recording_path, as_attachment=True, conditional=True)
         return jsonify({'status': 'error', 'message': 'No recording in progress to stop.'}), 400
 
-    recording_process.send_signal(signal.SIGINT)
-    recording_process.wait()
-    recording_process = None
-
-    # return recording video file
-    if os.path.exists(recording_path):
-        return send_file(recording_path, as_attachment=True)
-    else:
-        return abort(404, description="Recording failed")
-
-
-@app.route("/run_python", methods=['POST'])
-def run_python():
-    data = request.json
-    code = data.get('code', None)
-
-    if not code:
-        return jsonify({'status': 'error', 'message': 'Code not supplied!'}), 400
-
-    # Create a temporary file to save the Python code
-    import tempfile
-    import uuid
-    
-    # Generate unique filename
-    temp_filename = f"/tmp/python_exec_{uuid.uuid4().hex}.py"
-    
+    error_output = ""
     try:
-        # Write code to temporary file
-        with open(temp_filename, 'w') as f:
-            f.write(code)
-        
-        # Execute the file using subprocess to capture all output
-        result = subprocess.run(
-            ['/usr/bin/python3', temp_filename],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=30  # 30 second timeout
-        )
-        
-        # Clean up the temporary file
-        try:
-            os.remove(temp_filename)
-        except:
-            pass  # Ignore cleanup errors
-        
-        # Prepare response
-        output = result.stdout
-        error_output = result.stderr
-        
-        # Combine output and errors if both exist
-        combined_message = output
-        if error_output:
-            combined_message += ('\n' + error_output) if output else error_output
-        
-        # Determine status based on return code and errors
-        if result.returncode != 0:
-            status = 'error'
-            if not error_output:
-                # If no stderr but non-zero return code, add a generic error message
-                error_output = f"Process exited with code {result.returncode}"
-                combined_message = combined_message + '\n' + error_output if combined_message else error_output
-        else:
-            status = 'success'
-        
-        return jsonify({
-            'status': status,
-            'message': combined_message,
-            'need_more': False,      # Not applicable for file execution
-            'output': output,        # stdout only
-            'error': error_output,   # stderr only
-            'return_code': result.returncode
-        })
-        
+        # Send SIGINT for a graceful shutdown, allowing ffmpeg to finalize the file.
+        recording_process.send_signal(signal.SIGINT)
+        # Wait for ffmpeg to terminate. communicate() gets output and waits.
+        _, error_output = recording_process.communicate(timeout=15)
     except subprocess.TimeoutExpired:
-        # Clean up the temporary file on timeout
-        try:
-            os.remove(temp_filename)
-        except:
-            pass
-            
+        logger.error("ffmpeg did not respond to SIGINT, killing the process.")
+        recording_process.kill()
+        # After killing, communicate to get any remaining output.
+        _, error_output = recording_process.communicate()
+        recording_process = None
         return jsonify({
             'status': 'error',
-            'message': 'Execution timeout: Code took too long to execute',
-            'error': 'TimeoutExpired',
-            'need_more': False,
-            'output': None,
-        }), 500
-        
-    except Exception as e:
-        # Clean up the temporary file on error
-        try:
-            os.remove(temp_filename)
-        except:
-            pass
-            
-        # Capture the exception details
-        return jsonify({
-            'status': 'error',
-            'message': f'Execution error: {str(e)}',
-            'error': traceback.format_exc(),
-            'need_more': False,
-            'output': None,
+            'message': f'Recording process was unresponsive and had to be killed. Stderr: {error_output}'
         }), 500
 
-@app.route("/reset_python_console", methods=['POST'])
-def reset_python_console():
-    global console
-    
-    with console_lock:
-        # Create a new InteractiveConsole instance to reset the state
-        console = code.InteractiveConsole(locals={})
-    
-    return jsonify({
-        'status': 'success',
-        'message': 'Python console has been reset'
-    })
+    recording_process = None  # Clear the process from global state
+
+    # Check if the recording file was created and is not empty.
+    if os.path.exists(recording_path) and os.path.getsize(recording_path) > 0:
+        return send_file(recording_path, as_attachment=True, conditional=True)
+    else:
+        logger.error(f"Recording failed. The output file is missing or empty. ffmpeg stderr: {error_output}")
+        return abort(500, description=f"Recording failed. The output file is missing or empty. ffmpeg stderr: {error_output}")
+
+
+@app.route("/run_python_script", methods=['POST'])
+def run_python_script():
+    try:
+        data = request.get_json(force=True, silent=False) or {}
+        code: str = data.get("code", "")
+        timeout: int = int(data.get("timeout", 90))
+
+        if not isinstance(code, str) or code.strip() == "":
+            return jsonify({
+                "status": "error",
+                "message": "Field 'code' is required and must be a non-empty string",
+                "output": "",
+                "error": "invalid_request",
+                "returncode": -1
+            })
+
+        start_time = time.time()
+        tmp_file_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as tmpf:
+                tmpf.write(code)
+                tmp_file_path = tmpf.name
+
+            # Use the system default 'python' to match the controller
+            result = subprocess.run(
+                ["python", tmp_file_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout
+            )
+
+            duration = time.time() - start_time
+            status = "success" if result.returncode == 0 else "error"
+            return jsonify({
+                "status": status,
+                "message": "Script executed successfully" if status == "success" else "Script execution failed",
+                "output": result.stdout,
+                "error": result.stderr,
+                "returncode": result.returncode,
+                "duration": duration
+            })
+        finally:
+            if tmp_file_path and os.path.exists(tmp_file_path):
+                try:
+                    os.remove(tmp_file_path)
+                except Exception:
+                    pass
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "status": "error",
+            "message": "Script execution timed out",
+            "output": "",
+            "error": f"Timed out after {data.get('timeout', 90)} seconds",
+            "returncode": -1
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": "Unhandled server error",
+            "output": "",
+            "error": str(e),
+            "returncode": -1
+        })
 
 @app.route("/run_bash_script", methods=['POST'])
 def run_bash_script():
-    data = request.json
-    script = data.get('script', None)
-    timeout = data.get('timeout', 100)  # Default timeout of 30 seconds
-    working_dir = data.get('working_dir', None)
-    
-    if not script:
-        return jsonify({
-            'status': 'error',
-            'output': 'Script not supplied!',
-            'error': "",  # Always empty as requested
-            'returncode': -1
-        }), 400
-    
-    # Expand user directory if provided
-    if working_dir:
-        working_dir = os.path.expanduser(working_dir)
-        if not os.path.exists(working_dir):
-            return jsonify({
-                'status': 'error',
-                'output': f'Working directory does not exist: {working_dir}',
-                'error': "",  # Always empty as requested
-                'returncode': -1
-            }), 400
-    
-    # Create a temporary script file
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as tmp_file:
-        if "#!/bin/bash" not in script:
-            script = "#!/bin/bash\n\n" + script
-        tmp_file.write(script)
-        tmp_file_path = tmp_file.name
-    
     try:
-        # Make the script executable
-        os.chmod(tmp_file_path, 0o755)
-        
-        # Execute the script
-        if platform_name == "Windows":
-            # On Windows, use Git Bash or WSL if available, otherwise cmd
-            flags = subprocess.CREATE_NO_WINDOW
-            # Try to use bash if available (Git Bash, WSL, etc.)
-            result = subprocess.run(
-                ['bash', tmp_file_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # Merge stderr into stdout
-                text=True,
-                timeout=timeout,
-                cwd=working_dir,
-                creationflags=flags,
-                shell=False
-            )
-        else:
-            # On Unix-like systems, use bash directly
-            flags = 0
-            result = subprocess.run(
-                ['/bin/bash', tmp_file_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # Merge stderr into stdout
-                text=True,
-                timeout=timeout,
-                cwd=working_dir,
-                creationflags=flags,
-                shell=False
-            )
-        
-        # Log the command execution for trajectory recording
-        _append_event("BashScript", 
-                      {"script": script, "output": result.stdout, "error": "", "returncode": result.returncode}, 
-                      ts=time.time())
-        
+        data = request.get_json(force=True, silent=False) or {}
+        script: str = data.get("script", "")
+        timeout: int = int(data.get("timeout", 30))
+        working_dir = data.get("working_dir")
+
+        if not isinstance(script, str) or script.strip() == "":
+            return jsonify({
+                "status": "error",
+                "message": "Field 'script' is required and must be a non-empty string",
+                "output": "",
+                "error": "invalid_request",
+                "returncode": -1
+            })
+
+        cwd = None
+        if isinstance(working_dir, str) and working_dir.strip():
+            cwd = os.path.expanduser(os.path.expandvars(working_dir))
+            if not os.path.isdir(cwd):
+                return jsonify({
+                    "status": "error",
+                    "message": f"Working directory does not exist: {cwd}",
+                    "output": "",
+                    "error": "invalid_working_dir",
+                    "returncode": -1
+                })
+
+        start_time = time.time()
+        # Run with bash -lc to allow multi-line scripts and typical shell features
+        result = subprocess.run(
+            ["/bin/bash", "-lc", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            cwd=cwd
+        )
+
+        duration = time.time() - start_time
+        status = "success" if result.returncode == 0 else "error"
         return jsonify({
-            'status': 'success' if result.returncode == 0 else 'error',
-            'output': result.stdout,  # Contains both stdout and stderr merged
-            'error': "",  # Always empty as requested
-            'returncode': result.returncode
+            "status": status,
+            "output": result.stdout,
+            "error": result.stderr,
+            "returncode": result.returncode,
+            "duration": duration
         })
-        
     except subprocess.TimeoutExpired:
         return jsonify({
-            'status': 'error',
-            'output': f'Script execution timed out after {timeout} seconds',
-            'error': "",  # Always empty as requested
-            'returncode': -1
-        }), 500
-    except FileNotFoundError:
-        # Bash not found, try with sh
-        try:
-            result = subprocess.run(
-                ['sh', tmp_file_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # Merge stderr into stdout
-                text=True,
-                timeout=timeout,
-                cwd=working_dir,
-                shell=False
-            )
-            
-            _append_event("BashScript", 
-                          {"script": script, "output": result.stdout, "error": "", "returncode": result.returncode}, 
-                          ts=time.time())
-            
-            return jsonify({
-                'status': 'success' if result.returncode == 0 else 'error',
-                'output': result.stdout,  # Contains both stdout and stderr merged
-                'error': "",  # Always empty as requested
-                'returncode': result.returncode,
-            })
-        except Exception as e:
-            return jsonify({
-                'status': 'error',
-                'output': f'Failed to execute script: {str(e)}',
-                'error': "",  # Always empty as requested
-                'returncode': -1
-            }), 500
+            "status": "error",
+            "output": "",
+            "error": f"Script execution timed out after {data.get('timeout', 30)} seconds",
+            "returncode": -1
+        })
     except Exception as e:
         return jsonify({
-            'status': 'error',
-            'output': f'Failed to execute script: {str(e)}',
-            'error': "",  # Always empty as requested
-            'returncode': -1
-        }), 500
-    finally:
-        # Clean up the temporary file
+            "status": "error",
+            "output": "",
+            "error": str(e),
+            "returncode": -1
+        })
+
+
+@app.route("/set_screen_resolution", methods=['POST'])
+def set_screen_resolution():
+    """Set the screen resolution.
+
+    Request body can be either JSON or form data and must include 'width' and 'height'.
+    Currently implemented for Linux (X11) using xrandr. Other platforms return 501.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        width_str = data.get('width') or request.form.get('width')
+        height_str = data.get('height') or request.form.get('height')
+
+        if width_str is None or height_str is None:
+            return jsonify({
+                'status': 'error',
+                'message': "Missing required parameters 'width' and/or 'height'"
+            }), 400
+
         try:
-            os.unlink(tmp_file_path)
-        except:
-            pass
+            width_val = int(width_str)
+            height_val = int(height_str)
+        except (TypeError, ValueError):
+            return jsonify({
+                'status': 'error',
+                'message': 'Width and height must be integers'
+            }), 400
+
+        if width_val <= 0 or height_val <= 0:
+            return jsonify({
+                'status': 'error',
+                'message': 'Width and height must be positive'
+            }), 400
+
+        os_name = platform.system()
+
+        if os_name != 'Linux':
+            return jsonify({
+                'status': 'error',
+                'message': f'Setting screen resolution is not implemented for {os_name}'
+            }), 501
+
+        # Linux implementation using xrandr
+        # 1) Determine connected output (prefer primary)
+        xr = subprocess.run(['xrandr', '--query'], capture_output=True, text=True)
+        if xr.returncode != 0:
+            return jsonify({
+                'status': 'error',
+                'message': f"xrandr failed: {xr.stderr.strip() or xr.stdout.strip()}"
+            }), 500
+
+        output_name = None
+        fallback_output = None
+        for line in xr.stdout.splitlines():
+            if ' connected' in line:
+                name = line.split()[0]
+                if ' primary ' in f" {line} ":
+                    output_name = name
+                    break
+                if fallback_output is None:
+                    fallback_output = name
+        output_name = output_name or fallback_output
+
+        if not output_name:
+            return jsonify({
+                'status': 'error',
+                'message': 'No connected display output found via xrandr'
+            }), 500
+
+        target_mode = f"{width_val}x{height_val}"
+
+        # 2) Try to set the mode directly
+        direct = subprocess.run([
+            'xrandr', '--output', output_name, '--mode', target_mode
+        ], capture_output=True, text=True)
+
+        if direct.returncode != 0:
+            # 3) If the mode does not exist, create it using cvt -> newmode -> addmode
+            cvt = subprocess.run(['cvt', str(width_val), str(height_val), '60'],
+                                 capture_output=True, text=True)
+            if cvt.returncode != 0:
+                return jsonify({
+                    'status': 'error',
+                    'message': f"Failed to generate modeline with cvt: {cvt.stderr.strip() or cvt.stdout.strip()}"
+                }), 500
+
+            modeline_line = None
+            for line in cvt.stdout.splitlines():
+                if line.strip().lower().startswith('modeline'):
+                    modeline_line = line.strip()
+                    break
+
+            if not modeline_line:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Failed to parse modeline from cvt output'
+                }), 500
+
+            parts = modeline_line.split()
+            # Expected: Modeline "<name>" <params...>
+            if len(parts) < 3:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Unexpected modeline format: {modeline_line}'
+                }), 500
+
+            mode_name = parts[1].strip('"')
+            mode_params = parts[2:]
+
+            newmode = subprocess.run(['xrandr', '--newmode', mode_name] + mode_params,
+                                     capture_output=True, text=True)
+            # It might already exist; if so, proceed to addmode without failing hard
+            if newmode.returncode != 0 and 'already exists' not in (newmode.stderr or '').lower():
+                return jsonify({
+                    'status': 'error',
+                    'message': f"xrandr --newmode failed: {newmode.stderr.strip() or newmode.stdout.strip()}"
+                }), 500
+
+            addmode = subprocess.run(['xrandr', '--addmode', output_name, mode_name],
+                                     capture_output=True, text=True)
+            if addmode.returncode != 0 and 'already has' not in (addmode.stderr or '').lower():
+                return jsonify({
+                    'status': 'error',
+                    'message': f"xrandr --addmode failed: {addmode.stderr.strip() or addmode.stdout.strip()}"
+                }), 500
+
+            setmode = subprocess.run(['xrandr', '--output', output_name, '--mode', mode_name],
+                                     capture_output=True, text=True)
+            if setmode.returncode != 0:
+                return jsonify({
+                    'status': 'error',
+                    'message': f"xrandr set mode failed: {setmode.stderr.strip() or setmode.stdout.strip()}"
+                }), 500
+
+        return jsonify({
+            'status': 'success',
+            'message': f'Screen resolution set to {width_val}x{height_val} on {output_name}'
+        })
+
+    except Exception as e:
+        logger.exception("Failed to set screen resolution: %s", e)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host="0.0.0.0")

@@ -18,8 +18,7 @@ RETRY_INTERVAL = 5
 
 UBUNTU_X86_URL = "https://huggingface.co/datasets/xlangai/ubuntu_osworld/resolve/main/Ubuntu.qcow2.zip"
 WINDOWS_X86_URL = "https://huggingface.co/datasets/xlangai/windows_osworld/resolve/main/Windows-10-x64.qcow2.zip"
-# VMS_DIR = "./docker_vm_data"
-VMS_DIR = os.environ["VMS_DIR"]
+VMS_DIR = "./docker_vm_data"
 
 URL = UBUNTU_X86_URL
 DOWNLOADED_FILE_NAME = URL.split('/')[-1]
@@ -34,6 +33,12 @@ def _download_vm(vms_dir: str):
     # Download the virtual machine image
     logger.info("Downloading the virtual machine image...")
     downloaded_size = 0
+
+    # Check for HF_ENDPOINT environment variable and replace domain if set to hf-mirror.com
+    hf_endpoint = os.environ.get('HF_ENDPOINT')
+    if hf_endpoint and 'hf-mirror.com' in hf_endpoint:
+        URL = URL.replace('huggingface.co', 'hf-mirror.com')
+        logger.info(f"Using HF mirror: {URL}")
 
     downloaded_file_name = DOWNLOADED_FILE_NAME
 
@@ -94,7 +99,8 @@ class DockerVMManager(VMManager):
     def check_and_clean(self):
         pass
 
-    def delete_vm(self, vm_path):
+    def delete_vm(self, vm_path, region=None, **kwargs):
+        # Fixed: Added region and **kwargs parameters for interface compatibility
         pass
 
     def initialize_registry(self):
@@ -103,15 +109,25 @@ class DockerVMManager(VMManager):
     def list_free_vms(self):
         return os.path.join(VMS_DIR, DOWNLOADED_FILE_NAME)
 
-    def occupy_vm(self, vm_path):
+    def occupy_vm(self, vm_path, pid, region=None, **kwargs):
+        # Fixed: Added pid, region and **kwargs parameters for interface compatibility
         pass
 
-    def get_vm_path(self, os_type, region):
+    def get_vm_path(self, os_type, region, screen_size=(1920, 1080), **kwargs):
+        # Note: screen_size parameter is ignored for Docker provider
+        # but kept for interface consistency with other providers
         global URL, DOWNLOADED_FILE_NAME
         if os_type == "Ubuntu":
             URL = UBUNTU_X86_URL
         elif os_type == "Windows":
             URL = WINDOWS_X86_URL
+        
+        # Check for HF_ENDPOINT environment variable and replace domain if set to hf-mirror.com
+        hf_endpoint = os.environ.get('HF_ENDPOINT')
+        if hf_endpoint and 'hf-mirror.com' in hf_endpoint:
+            URL = URL.replace('huggingface.co', 'hf-mirror.com')
+            logger.info(f"Using HF mirror: {URL}")
+            
         DOWNLOADED_FILE_NAME = URL.split('/')[-1]
 
         if DOWNLOADED_FILE_NAME.endswith(".zip"):

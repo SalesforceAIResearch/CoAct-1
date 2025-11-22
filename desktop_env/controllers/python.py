@@ -1,9 +1,10 @@
 import json
 import logging
+import os
 import random
-import traceback
 from typing import Any, Dict, Optional
 import time
+import traceback
 import requests
 
 from desktop_env.actions import KEYBOARD_KEYS
@@ -21,17 +22,41 @@ class PythonController:
         self.retry_times = 3
         self.retry_interval = 5
 
+    @staticmethod
+    def _is_valid_image_response(content_type: str, data: Optional[bytes]) -> bool:
+        """Quick validation for PNG/JPEG payload using magic bytes; Content-Type is advisory.
+        Returns True only when bytes look like a real PNG or JPEG.
+        """
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            return False
+        # PNG magic
+        if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+            return True
+        # JPEG magic
+        if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
+            return True
+        # If server explicitly marks as image, accept as a weak fallback (some environments strip magic)
+        if content_type and ("image/png" in content_type or "image/jpeg" in content_type or "image/jpg" in content_type):
+            return True
+        return False
+
     def get_screenshot(self) -> Optional[bytes]:
         """
         Gets a screenshot from the server. With the cursor. None -> no screenshot or unexpected error.
         """
 
-        for _ in range(self.retry_times):
+        for attempt_idx in range(self.retry_times):
             try:
-                response = requests.get(self.http_server + "/screenshot")
+                response = requests.get(self.http_server + "/screenshot", timeout=10)
                 if response.status_code == 200:
-                    logger.info("Got screenshot successfully")
-                    return response.content
+                    content_type = response.headers.get("Content-Type", "")
+                    content = response.content
+                    if self._is_valid_image_response(content_type, content):
+                        logger.info("Got screenshot successfully")
+                        return content
+                    else:
+                        logger.error("Invalid screenshot payload (attempt %d/%d).", attempt_idx + 1, self.retry_times)
+                        logger.info("Retrying to get screenshot.")
                 else:
                     logger.error("Failed to get screenshot. Status code: %d", response.status_code)
                     logger.info("Retrying to get screenshot.")
@@ -42,6 +67,19 @@ class PythonController:
 
         logger.error("Failed to get screenshot.")
         return None
+
+    def set_vm_screen_size(self, width: int, height: int):
+        """
+        Sets the size of the vm screen.
+        """
+        response = requests.post(self.http_server + "/set_screen_resolution", json={"width": width, "height": height})
+        if response.status_code == 200:
+            logger.debug("Set screen size successfully")
+            return response.json()
+        else:
+            logger.error("Failed to set screen size. Status code: %d", response.status_code)
+            logger.debug("Retrying to set screen size.")
+            return None
 
     def get_accessibility_tree(self) -> Optional[str]:
         """
@@ -109,90 +147,7 @@ class PythonController:
         logger.error("Failed to get file.")
         return None
 
-    def play_trajectory(self, events: list[dict], show_logs: bool = False, step_to_evaluate: int = 0, sleep_interval: float = 1.0):
-        """
-        Plays a trajectory file on the remote machine by sending command one by one.
-        :param events: The events to play.
-        :param step_evaluate: Whether to evaluate the trajectory step by step.
-        """
-        # sort by timestamp and prepare for timed replay
-        events.sort(key=lambda e: e['ts'])
-        start_time = time.time()
-        start_ts = events[0]['ts']
-        logs = []
-        if show_logs:
-            log_msg = f"Starting trajectory replay. Events: {len(events)}"
-            logger.info(log_msg)
-            logs.append(log_msg)
-
-
-        def _clean_key(key_str: str) -> str:
-            return key_str.strip("'").replace('Key.', '')
-
-        for i, event in enumerate(events):
-            # sync with wall-clock time
-            target_time = start_time + (event['ts'] - start_ts)
-            sleep_for = target_time - time.time()
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-
-            op = event['op']
-            if show_logs:
-                log_msg = f"Executing event {i+1}/{len(events)}: {op} with params {event}"
-                logger.info(log_msg)
-                logs.append(log_msg)
-
-            command = None
-            if op == "Click":
-                command = f"pyautogui.click(x={event['x']}, y={event['y']})"
-            elif op == "LeftDouble":
-                command = f"pyautogui.doubleClick(x={event['x']}, y={event['y']})"
-            elif op == "RightSingle":
-                command = f"pyautogui.rightClick(x={event['x']}, y={event['y']})"
-            elif op == "Drag":
-                command = f"pyautogui.moveTo({event['x1']}, {event['y1']}, _pause=False); pyautogui.dragTo({event['x2']}, {event['y2']}, duration=0.5, button='left', _pause=False)"
-            elif op == "Scroll":
-                scroll_dist = 120 if event['direction'] == 'up' else -120
-                command = f"pyautogui.scroll({scroll_dist}, x={event['x']}, y={event['y']})"
-            elif op == "Type":
-                word = event['word']
-                command = "pyautogui.write({:}, interval=0.01)".format(repr(word))
-            elif op == "Hotkey":
-                key = _clean_key(event['key'])
-                command = f"pyautogui.press('{key}')"
-            elif op == "CombKey":
-                clean_keys = [_clean_key(k) for k in event['keys']]
-                keys_str = "', '".join(clean_keys)
-                command = f"pyautogui.hotkey('{keys_str}')"
-            elif op == "Wait":
-                time.sleep(sleep_interval)
-                continue
-            elif op == "Command":
-                # This is a system command
-                result = self.execute_sys_command(event["command"])
-                if show_logs:
-                    log_msg = f"Command executed. Result: {result}"
-                    logger.info(log_msg)
-                    logs.append(log_msg)
-            
-            if command:
-                result = self.execute_python_command(command)
-                
-                if result is None:
-                    logger.error(f"Failed to execute command for event: {event}")
-                    return {"status": "error", "msg": f"Failed to execute command for event: {event}", "log": logs}
-
-            if step_to_evaluate == i:
-                break
-
-            time.sleep(sleep_interval)
-
-        if show_logs:
-            logger.info("Trajectory replay finished.")
-        
-        return {"status": "success", "msg": "Trajectory replayed", "log": logs}
-
-    def execute_gui_command(self, command: str) -> Optional[Dict[str, Any]]:
+    def execute_python_command(self, command: str) -> None:
         """
         Executes a python command on the server.
         It can be used to execute the pyautogui commands, or... any other python command. who knows?
@@ -220,60 +175,55 @@ class PythonController:
 
         logger.error("Failed to execute command.")
         return None
-
-    def execute_python_command(self, command: str) -> Optional[Dict[str, Any]]:
-        """
-        Executes a python command on the server.
-        It can be used to execute the pyautogui commands, or... any other python command. who knows?
-        """
-        # command_list = ["python", "-c", self.pkgs_prefix.format(command=command)]
-        payload = json.dumps({"code": command})
+    
+    def run_python_script(self, script: str, timeout: int = 90) -> Optional[Dict[str, Any]]:
+        """Execute a Python script via the server's /run_python_script endpoint."""
+        payload = json.dumps({"code": script, "timeout": timeout})
 
         for _ in range(self.retry_times):
             try:
-                response = requests.post(self.http_server + "/run_python", headers={'Content-Type': 'application/json'},
-                                         data=payload, timeout=90)
+                response = requests.post(
+                    self.http_server + "/run_python_script",
+                    headers={'Content-Type': 'application/json'},
+                    data=payload,
+                    timeout=timeout + 10,
+                )
                 if response.status_code == 200:
                     return response.json()
-                else:
-                    return {"status": "error", "message": "Failed to execute command.", "output": None, "error": response.json()["error"]}
+                # Try to return server-provided error if available
+                try:
+                    return response.json()
+                except Exception:
+                    return {
+                        "status": "error",
+                        "message": f"Failed to execute python script (HTTP {response.status_code})",
+                        "output": "",
+                        "error": response.text,
+                        "returncode": -1,
+                    }
             except requests.exceptions.ReadTimeout:
-                break
+                return {
+                    "status": "error",
+                    "message": "Script execution timed out",
+                    "output": "",
+                    "error": f"Timed out after {timeout} seconds",
+                    "returncode": -1,
+                }
             except Exception:
-                logger.error("An error occurred while trying to execute the command: %s", traceback.format_exc())
+                logger.error("An error occurred while trying to execute the python script: %s", traceback.format_exc())
                 logger.info("Retrying to execute command.")
             time.sleep(self.retry_interval)
 
-        logger.error("Failed to execute command.")
-        return {"status": "error", "message": "Failed to execute command.", "output": "", "error": "Retry limit reached."}
-
-    def execute_sys_command(self, command: str) -> Optional[Dict[str, Any]]:
-        """
-        Executes a python command on the server.
-        It can be used to execute the pyautogui commands, or... any other python command. who knows?
-        """
-        payload = json.dumps({"command": command, "shell": False})
-
-        for _ in range(self.retry_times):
-            try:
-                response = requests.post(self.http_server + "/execute", headers={'Content-Type': 'application/json'},
-                                         data=payload, timeout=90)
-                if response.status_code == 200:
-                    return response.json()["output"]
-                else:
-                    logger.error("Failed to execute command. Status code: %d", response.status_code)
-                    logger.info("Retrying to execute command.")
-            except requests.exceptions.ReadTimeout:
-                break
-            except Exception as e:
-                logger.error("An error occurred while trying to execute the command: %s", e)
-                logger.info("Retrying to execute command.")
-            time.sleep(self.retry_interval)
-
-        logger.error("Failed to execute command.")
-        return None
-
-    def execute_bash_script(self, script: str, timeout: int = 30, working_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        logger.error("Failed to execute python script.")
+        return {
+            "status": "error",
+            "message": "Failed to execute command.",
+            "output": "",
+            "error": "Retry limit reached.",
+            "returncode": -1,
+        }
+    
+    def run_bash_script(self, script: str, timeout: int = 30, working_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Executes a bash script on the server.
         
@@ -324,20 +274,6 @@ class PythonController:
             "error": f"Failed to execute bash script after {self.retry_times} retries",
             "returncode": -1
         }
-
-    def reset_python_console(self):
-        """
-        Resets the python console on the server.
-        """
-        for _ in range(self.retry_times):
-            try:
-                response = requests.post(self.http_server + "/reset_python_console")
-                if response.status_code == 200:
-                    return
-            except Exception as e:
-                logger.error("An error occurred while trying to reset the python console: %s", e)
-                logger.info("Retrying to reset the python console.")
-            time.sleep(self.retry_interval)
 
     def execute_action(self, action: Dict[str, Any]):
         """
@@ -529,30 +465,104 @@ class PythonController:
 
         logger.error("Failed to start recording.")
 
-    def end_recording(self, dest: str):
-        """
-        Ends recording the screen.
-        """
+    def end_recording(self, dest: str, connect_timeout: float = 5.0, read_timeout: float = 600.0,
+                      chunk_size: int = 1024 * 1024) -> None:
+        url = self.http_server.rstrip("/") + "/end_recording"
+        tmp_path = dest + ".part"
 
-        for _ in range(self.retry_times):
+        if os.path.exists(dest) and not os.path.exists(tmp_path):
+            logger.info("Target file already exists, skipping download: %s", dest)
+            return
+
+        start_offset = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+        base_sleep = max(0.5, self.retry_interval)
+        session = requests.Session()
+
+        for attempt in range(1, self.retry_times + 1):
             try:
-                response = requests.post(self.http_server + "/end_recording")
-                if response.status_code == 200:
-                    logger.info("Recording stopped successfully")
-                    with open(dest, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
-                    return
-                else:
-                    logger.error("Failed to stop recording. Status code: %d", response.status_code)
-                    logger.info("Retrying to stop recording.")
-            except Exception as e:
-                logger.error("An error occurred while trying to stop recording: %s", e)
-                logger.info("Retrying to stop recording.")
-            time.sleep(self.retry_interval)
+                headers = {}
+                if start_offset > 0:
+                    headers["Range"] = f"bytes={start_offset}-"
 
-        logger.error("Failed to stop recording.")
+                logger.info("Stopping recording & fetching video (attempt %d/%d). Range: %s",
+                            attempt, self.retry_times, headers.get("Range", "full"))
+
+                with session.post(
+                    url,
+                    headers=headers,
+                    stream=True,
+                    timeout=(connect_timeout, read_timeout)
+                ) as response:
+                    status = response.status_code
+
+                    if status not in (200, 206):
+                        logger.error("Failed to stop recording. HTTP %s", status)
+                        raise RuntimeError(f"Unexpected HTTP status {status}")
+
+                    content_range: Optional[str] = response.headers.get("Content-Range")
+                    is_resuming = (status == 206 and content_range and content_range.startswith("bytes"))
+
+                    os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
+                    with open(tmp_path, "ab" if is_resuming and start_offset > 0 else "wb") as f:
+                        bytes_written_this_round = 0
+                        for chunk in response.iter_content(chunk_size=chunk_size):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            bytes_written_this_round += len(chunk)
+
+                        try:
+                            f.flush()
+                            os.fsync(f.fileno())
+                        except OSError as ioe:
+                            logger.error("Flush/fsync failed: %s", ioe)
+                            raise
+                    try:
+                        if status == 206 and content_range:
+                            _, rng = content_range.split(" ", 1)
+                            byte_range, total_str = rng.split("/")
+                            start_str, end_str = byte_range.split("-")
+                            end_pos = int(end_str)
+                            total = int(total_str)
+                            final_size = end_pos + 1
+                            actual_size = os.path.getsize(tmp_path)
+                            if actual_size != final_size:
+                                raise RuntimeError(
+                                    f"Resume size mismatch: expected {final_size}, got {actual_size}"
+                                )
+                            logger.info("Resumed download ok. %d/%d bytes.", actual_size, total)
+                        elif status == 200:
+                            cl = response.headers.get("Content-Length")
+                            if cl is not None:
+                                expected = int(cl)
+                                actual = os.path.getsize(tmp_path)
+                                if actual != expected:
+                                    raise RuntimeError(
+                                        f"Size mismatch: expected {expected}, got {actual}"
+                                    )
+                            logger.info("Full download ok. Size=%d bytes.", os.path.getsize(tmp_path))
+                    except Exception as verify_err:
+                        logger.error("Verification failed: %s", verify_err)
+                        raise
+
+                    os.replace(tmp_path, dest)
+                    logger.info("Recording stopped successfully. Saved to %s", dest)
+                    return
+
+            except (requests.Timeout, requests.ConnectionError) as net_err:
+                logger.error("Network error: %s", net_err)
+            except OSError as io_err:
+                logger.error("File system error (disk full / permission?): %s", io_err)
+                break
+            except Exception as e:
+                logger.error("Unexpected error: %s", e)
+
+            if attempt < self.retry_times:
+                sleep_s = min(base_sleep * (2 ** (attempt - 1)), 60.0)
+                logger.info("Retrying in %.1f seconds...", sleep_s)
+                time.sleep(sleep_s)
+
+        logger.error("Failed to stop recording after %d attempts.", self.retry_times)
 
     # Additional info
     def get_vm_platform(self):
@@ -670,46 +680,4 @@ class PythonController:
             time.sleep(self.retry_interval)
 
         logger.error("Failed to get directory tree.")
-        return None
-
-    def start_trajectory(self):
-        """
-        Starts recording the trajectory.
-        """
-        for _ in range(self.retry_times):
-            try:
-                response = requests.post(self.http_server + "/start_trajectory")
-                if response.status_code == 200:
-                    logger.info("Trajectory recording started successfully")
-                    return
-                else:
-                    logger.error("Failed to start trajectory recording. Status code: %d", response.status_code)
-                    logger.info("Retrying to start trajectory recording.")
-            except Exception as e:
-                logger.error("An error occurred while trying to start trajectory recording: %s", e)
-                logger.info("Retrying to start trajectory recording.")
-            time.sleep(self.retry_interval)
-
-        logger.error("Failed to start trajectory recording.")
-        return None
-
-    def end_trajectory(self):
-        """
-        Ends recording the trajectory.
-        """
-        for _ in range(self.retry_times):
-            try:
-                response = requests.post(self.http_server + "/end_trajectory")
-                if response.status_code == 200:
-                    logger.info("Trajectory recording stopped successfully")
-                    return response.json()["trajectories"]
-                else:
-                    logger.error("Failed to stop trajectory recording. Status code: %d", response.status_code)
-                    logger.info("Retrying to stop trajectory recording.")
-            except Exception as e:
-                logger.error("An error occurred while trying to stop trajectory recording: %s", e)
-                logger.info("Retrying to stop trajectory recording.")
-            time.sleep(self.retry_interval)
-
-        logger.error("Failed to stop trajectory recording.")
         return None

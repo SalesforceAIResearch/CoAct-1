@@ -32,6 +32,12 @@
   "evaluator": {
     "postconfig": [
       {
+        "type": "activate_window",
+        "parameters": {
+          "window_name": "GNU Image Manipulation Program"
+        }
+      },
+      {
         "type": "execute",
         "parameters": {
           "command": [
@@ -82,8 +88,8 @@
     ],
     "func": "check_image_mirror",
     "expected": {
-      "type": "vm_file",
-      "path": "/home/user/Desktop/berry.png",
+      "type": "cloud_file",
+      "path": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/gimp/72f83cdc-bf76-4531-9a1b-eb893a13f8aa/berry.jpeg",
       "dest": "berry.png"
     },
     "result": {
@@ -92,5 +98,7 @@
       "dest": "berry_mirror.png"
     }
   },
-  "proxy": false
+  "proxy": false,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low"
 }

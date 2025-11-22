@@ -1,7 +1,7 @@
 import logging
 import os
 import subprocess
-from typing import Dict, Tuple
+from typing import Dict
 from xml.etree import ElementTree
 from urllib.parse import urlparse
 
@@ -18,7 +18,7 @@ from skimage.metrics import structural_similarity as ssim
 logger = logging.getLogger("desktopenv.metrics.vlc")
 
 
-def is_vlc_playing(actual_status_path: str, rule: Dict[str, str]) -> Tuple[float, str]:
+def is_vlc_playing(actual_status_path: str, rule: Dict[str, str]) -> float:
     """
     Checks if VLC is currently playing a file.
     """
@@ -52,24 +52,24 @@ def is_vlc_playing(actual_status_path: str, rule: Dict[str, str]) -> Tuple[float
                 # Method 1: Direct filename match (most precise)
                 actual_basename = os.path.basename(file_info)
                 if actual_basename == expected_filename:
-                    return 1, f"VLC is playing the expected file: {expected_filename}"
+                    return 1
                 
                 # Method 2: Endswith match (for backward compatibility)
                 if file_info.endswith(expected_filename):
-                    return 1, f"VLC is playing a file ending with: {expected_filename}"
+                    return 1
                 
                 # Method 3: For paths, check if expected filename is in the path
                 if expected_filename in file_info:
                     # Additional check to avoid false positives
                     # Make sure it's actually the filename, not just part of a path
                     if file_info.endswith('/' + expected_filename) or file_info.endswith('\\' + expected_filename):
-                        return 1, f"VLC is playing the expected file from path: {file_info}"
+                        return 1
                 
                 logger.warning(f"File name mismatch - Expected: {expected_filename}, Found: {file_info}")
-                return 0, f"File name mismatch - Expected: {expected_filename}, Found: {file_info}"
+                return 0
             else:
                 logger.warning(f"Could not find file information in VLC status XML for rule: {rule}")
-                return 0, f"Could not find file information in VLC status XML"
+                return 0
         elif rule['type'] == 'url':
             # Try multiple possible paths for URL information in VLC XML
             url_paths = [
@@ -100,7 +100,7 @@ def is_vlc_playing(actual_status_path: str, rule: Dict[str, str]) -> Tuple[float
                 
                 # Method 1: Direct URL match
                 if expected_url in file_info or file_info.endswith(expected_url):
-                    return 1, f"VLC is playing the expected URL: {expected_url}"
+                    return 1
                 
                 # Method 2: For HLS streams, VLC often shows just the filename instead of full URL
                 # Check if the file_info matches the filename part of the expected URL
@@ -111,7 +111,7 @@ def is_vlc_playing(actual_status_path: str, rule: Dict[str, str]) -> Tuple[float
                     # If VLC shows just the filename (common for HLS streams)
                     if file_info == expected_filename:
                         logger.info(f"URL filename match - Expected URL: {expected_url}, VLC shows filename: {file_info}")
-                        return 1, f"VLC is playing the expected URL (filename match): {expected_filename}"
+                        return 1
                     
                     # Method 3: Check if both are URLs from the same domain and similar path
                     if '://' in file_info:  # file_info is also a URL
@@ -119,25 +119,25 @@ def is_vlc_playing(actual_status_path: str, rule: Dict[str, str]) -> Tuple[float
                         # Same domain and similar path structure
                         if (expected_parsed.netloc == actual_parsed.netloc and 
                             expected_parsed.path in actual_parsed.path):
-                            return 1, f"VLC is playing URL from same domain with similar path: {file_info}"
+                            return 1
                 except Exception as e:
                     logger.debug(f"URL parsing error: {e}")
                     pass
                 
                 logger.warning(f"URL mismatch - Expected: {expected_url}, Found: {file_info}")
-                return 0, f"URL mismatch - Expected: {expected_url}, Found: {file_info}"
+                return 0
             else:
                 logger.warning(f"Could not find URL information in VLC status XML for rule: {rule}")
-                return 0, f"Could not find URL information in VLC status XML"
+                return 0
         else:
             logger.error(f"Unknown type: {rule['type']}")
-            return 0, f"Unknown rule type: {rule['type']}"
+            return 0
     else:
-        return 0, f"VLC is not playing (status: {status})"
+        return 0
 
 
 # fixme: part of this function can be moved to getters
-def is_vlc_recordings_folder(actual_config_path: str, rule: Dict[str, str]) -> Tuple[float, str]:
+def is_vlc_recordings_folder(actual_config_path: str, rule: Dict[str, str]) -> float:
     """
     Checks if VLC's recording folder is set to the expected value.
     """
@@ -157,37 +157,37 @@ def is_vlc_recordings_folder(actual_config_path: str, rule: Dict[str, str]) -> T
                 current_path = line.split('=')[-1].strip()
                 # Compare with the Desktop path
                 if current_path == expected_recording_file_path:
-                    return 1, f"Recording folder is correctly set to: {expected_recording_file_path}"
+                    return 1
                 else:
-                    return 0, f"Recording folder mismatch - Expected: {expected_recording_file_path}, Found: {current_path}"
+                    return 0
         # The configuration key was not found in the file
-        return 0, "Recording folder configuration key 'input-record-path' not found in VLC config"
+        return 0
     except FileNotFoundError:
         logger.error("VLC configuration file not found.")
-        return 0, "VLC configuration file not found"
+        return 0
     except Exception as e:
         logger.error(f"An error occurred: {e}")
-        return 0, f"Error reading VLC configuration: {str(e)}"
+        return 0
 
 
-def is_vlc_fullscreen(actual_window_size, screen_size) -> Tuple[float, str]:
+def is_vlc_fullscreen(actual_window_size, screen_size):
     if screen_size is None or actual_window_size is None:
         # if the screen size is not available, means that the window is not fullscreen
-        return 0, "Screen size or window size information not available"
+        return 0
 
     if actual_window_size['width'] == screen_size['width'] and actual_window_size['height'] == screen_size['height']:
-        return 1, f"VLC is in fullscreen mode ({screen_size['width']}x{screen_size['height']})"
+        return 1
     else:
-        return 0, f"VLC is not in fullscreen - Window: {actual_window_size['width']}x{actual_window_size['height']}, Screen: {screen_size['width']}x{screen_size['height']}"
+        return 0
 
 
-def compare_images(image1_path, image2_path, **options) -> Tuple[float, str]:
+def compare_images(image1_path, image2_path, **options):
     # You would call this function with the paths to the two images you want to compare:
     # score = compare_images('path_to_image1', 'path_to_image2')
     # print("Similarity score:", score)
 
     if not image1_path or not image2_path:
-        return 0, "One or both image paths are missing"
+        return 0
 
     base_score = options.get("reference_base_result", None)
 
@@ -213,14 +213,13 @@ def compare_images(image1_path, image2_path, **options) -> Tuple[float, str]:
     epsilon = 0.01
     if base_score is not None:
         if similarity_index >= base_score + epsilon:
-            score = (similarity_index - base_score) / (1 - base_score)
-            return score, f"Images are similar (SSIM: {similarity_index:.3f}, normalized score: {score:.3f})"
+            return (similarity_index - base_score) / (1 - base_score)
         else:
-            return 0, f"Images are not similar enough (SSIM: {similarity_index:.3f} < base_score {base_score} + epsilon)"
+            return 0
     else:
-        return similarity_index, f"Image similarity SSIM score: {similarity_index:.3f}"
+        return similarity_index
 
-def compare_audios(audio_path_1, audio_path_2) -> Tuple[float, str]:
+def compare_audios(audio_path_1, audio_path_2):
     """
     Compare two audio files and return a similarity score in the range [0, 1].
     audio_path_1, audio_path_2: paths to the audio files to compare
@@ -229,7 +228,7 @@ def compare_audios(audio_path_1, audio_path_2) -> Tuple[float, str]:
     # print(f'Similarity Score: {similarity}')
 
     if not audio_path_1 or not audio_path_2:
-        return 0, "One or both audio paths are missing"
+        return 0
 
     y1, y2 = None, None
     try:
@@ -248,12 +247,11 @@ def compare_audios(audio_path_1, audio_path_2) -> Tuple[float, str]:
 
     if is_y1_bad and is_y2_bad:
         logger.info("Both audio files are empty or corrupt. Considering them perfectly similar.")
-        return 1.0, "Both audio files are empty or corrupt - considered identical"
+        return 1.0
     
     if is_y1_bad or is_y2_bad:
         logger.warning(f"One audio file is empty/corrupt, the other is not. Similarity is 0.")
-        bad_file = audio_path_1 if is_y1_bad else audio_path_2
-        return 0.0, f"Audio file is empty or corrupt: {os.path.basename(bad_file)}"
+        return 0.0
 
     try:
         logger.info(f"Audio 1 ({os.path.basename(audio_path_1)}): sr={sr1}, len={len(y1)}")
@@ -264,7 +262,7 @@ def compare_audios(audio_path_1, audio_path_2) -> Tuple[float, str]:
         mfcc2 = librosa.feature.mfcc(y=y2, sr=sr2)
     except Exception as e:
         logger.error(f"Error during MFCC extraction: {e}")
-        return 0.0, f"Error during MFCC feature extraction: {str(e)}"
+        return 0.0
 
     # Normalize the MFCC features
     mfcc1 = librosa.util.normalize(mfcc1, axis=1)
@@ -288,14 +286,14 @@ def compare_audios(audio_path_1, audio_path_2) -> Tuple[float, str]:
     # Convert the normalized distance to a similarity score using an exponential decay function.
     similarity = np.exp(-normalized_distance)
 
-    return similarity, f"Audio similarity score: {similarity:.3f} (normalized DTW distance: {normalized_distance:.4f})"
+    return similarity
 
 
 def compare_audios_by_dl_model(audio_path_1, audio_path_2):
     pass
 
 
-def compare_videos(video_path1, video_path2, max_frames_to_check=100, threshold=5) -> Tuple[float, str]:
+def compare_videos(video_path1, video_path2, max_frames_to_check=100, threshold=5):
     # Open both video files
     cap1 = cv2.VideoCapture(video_path1)
     cap2 = cv2.VideoCapture(video_path2)
@@ -310,10 +308,7 @@ def compare_videos(video_path1, video_path2, max_frames_to_check=100, threshold=
 
         # If a video ends, then check if both ended to confirm they are of the same length
         if not ret1 or not ret2:
-            if ret1 == ret2:
-                return 1., f"Videos are identical (both ended at frame {frames_checked})"
-            else:
-                return 0., f"Videos have different lengths - one ended at frame {frames_checked}"
+            return 1. if ret1 == ret2 else 0. # return float only 
 
         # Convert frames to PIL Images
         frame1 = Image.fromarray(cv2.cvtColor(frame1, cv2.COLOR_BGR2RGB))
@@ -331,13 +326,13 @@ def compare_videos(video_path1, video_path2, max_frames_to_check=100, threshold=
             mismatch_count += 1
             # If there's a significant difference, the frames are not the same
             if mismatch_count > threshold:
-                return 0., f"Videos differ significantly - {mismatch_count} mismatched frames found in first {frames_checked} frames"
+                return 0.
 
     # If we reach here, the content appears to be the same
-    return 1., f"Videos appear identical after checking {frames_checked} frames"
+    return 1.
 
 
-def check_qt_bgcone(actual_config_path, rule) -> Tuple[float, str]:
+def check_qt_bgcone(actual_config_path, rule):
     with open(actual_config_path, 'rb') as file:
         config_file = file.read().decode('utf-8')
 
@@ -356,18 +351,18 @@ def check_qt_bgcone(actual_config_path, rule) -> Tuple[float, str]:
             # The configuration key was not found in the file
 
         if qt_bgcone == expected_qt_bgcone:
-            return 1, f"qt-bgcone is correctly set to: {expected_qt_bgcone}"
+            return 1
         else:
-            return 0, f"qt-bgcone mismatch - Expected: {expected_qt_bgcone}, Found: {qt_bgcone}"
+            return 0
     except FileNotFoundError:
         logger.error("VLC configuration file not found.")
-        return 0, "VLC configuration file not found"
+        return 0
     except Exception as e:
         logger.error(f"An error occurred: {e}")
-        return 0, f"Error reading VLC configuration: {str(e)}"
+        return 0
 
 
-def check_qt_max_volume(actual_config_path, rule) -> Tuple[float, str]:
+def check_qt_max_volume(actual_config_path, rule):
     with open(actual_config_path, 'rb') as file:
         config_file = file.read().decode('utf-8')
 
@@ -383,18 +378,18 @@ def check_qt_max_volume(actual_config_path, rule) -> Tuple[float, str]:
             # The configuration key was not found in the file
 
         if qt_max_volume == expected_qt_max_volume:
-            return 1, f"qt-max-volume is correctly set to: {expected_qt_max_volume}"
+            return 1
         else:
-            return 0, f"qt-max-volume mismatch - Expected: {expected_qt_max_volume}, Found: {qt_max_volume}"
+            return 0
     except FileNotFoundError:
         logger.error("VLC configuration file not found.")
-        return 0, "VLC configuration file not found"
+        return 0
     except Exception as e:
         logger.error(f"An error occurred: {e}")
-        return 0, f"Error reading VLC configuration: {str(e)}"
+        return 0
 
 
-def check_qt_minimal_view(actual_config_path, rule) -> Tuple[float, str]:
+def check_qt_minimal_view(actual_config_path, rule):
     with open(actual_config_path, 'rb') as file:
         config_file = file.read().decode('utf-8')
 
@@ -409,18 +404,18 @@ def check_qt_minimal_view(actual_config_path, rule) -> Tuple[float, str]:
                 qt_minimal_view = line.split('=')[-1].strip()
 
         if qt_minimal_view == expected_qt_minimal_view:
-            return 1, f"qt-minimal-view is correctly set to: {expected_qt_minimal_view}"
+            return 1
         else:
-            return 0, f"qt-minimal-view mismatch - Expected: {expected_qt_minimal_view}, Found: {qt_minimal_view}"
+            return 0
     except FileNotFoundError:
         logger.error("VLC configuration file not found.")
-        return 0, "VLC configuration file not found"
+        return 0
     except Exception as e:
         logger.error(f"An error occurred: {e}")
-        return 0, f"Error reading VLC configuration: {str(e)}"
+        return 0
 
 
-def check_qt_slider_colours(actual_config_path, rule) -> Tuple[float, str]:
+def check_qt_slider_colours(actual_config_path, rule):
     with open(actual_config_path, 'rb') as file:
         config_file = file.read().decode('utf-8')
 
@@ -434,9 +429,9 @@ def check_qt_slider_colours(actual_config_path, rule) -> Tuple[float, str]:
         if rule['type'] == 'match':
             expected_qt_slider_colours = rule['expected_qt_slider_colours']
             if qt_slider_colours == expected_qt_slider_colours:
-                return 1, f"qt-slider-colours matches expected: {expected_qt_slider_colours}"
+                return 1
             else:
-                return 0, f"qt-slider-colours mismatch - Expected: {expected_qt_slider_colours}, Found: {qt_slider_colours}"
+                return 0
         elif rule['type'] == 'blackish':
             def is_color_blackish(rgb_values, threshold=100):
                 # decide if the color is blackish
@@ -455,18 +450,18 @@ def check_qt_slider_colours(actual_config_path, rule) -> Tuple[float, str]:
                 if is_color_blackish(color):
                     pass
                 else:
-                    return 0, f"Not all slider colors are blackish - Found non-blackish color: RGB{color}"
-            return 1, f"All slider colors are blackish (threshold < 100)"
+                    return 0
+            return 1
 
     except FileNotFoundError:
         logger.error("VLC configuration file not found.")
-        return 0, "VLC configuration file not found"
+        return 0
     except Exception as e:
         logger.error(f"An error occurred: {e}")
-        return 0, f"Error reading VLC configuration: {str(e)}"
+        return 0
 
 
-def check_global_key_play_pause(actual_config_path, rule) -> Tuple[float, str]:
+def check_global_key_play_pause(actual_config_path, rule):
     """
     # Play/Pause (str)
     #global-key-play-pause=
@@ -490,21 +485,18 @@ def check_global_key_play_pause(actual_config_path, rule) -> Tuple[float, str]:
                 global_key_play_pause = "0" if line.split('=')[-1].strip() == "" else "1"
 
         if global_key_play_pause == expected_global_key_play_pause:
-            status = "disabled" if global_key_play_pause == "0" else "enabled"
-            return 1, f"global-key-play-pause is correctly {status}"
+            return 1
         else:
-            expected_status = "disabled" if expected_global_key_play_pause == "0" else "enabled"
-            actual_status = "disabled" if global_key_play_pause == "0" else "enabled"
-            return 0, f"global-key-play-pause mismatch - Expected: {expected_status}, Found: {actual_status}"
+            return 0
     except FileNotFoundError:
         logger.error("VLC configuration file not found.")
-        return 0, "VLC configuration file not found"
+        return 0
     except Exception as e:
         logger.error(f"An error occurred: {e}")
-        return 0, f"Error reading VLC configuration: {str(e)}"
+        return 0
 
 
-def check_one_instance_when_started_from_file(actual_config_path, rule) -> Tuple[float, str]:
+def check_one_instance_when_started_from_file(actual_config_path, rule):
     with open(actual_config_path, 'rb') as file:
         config_file = file.read().decode('utf-8')
 
@@ -521,15 +513,12 @@ def check_one_instance_when_started_from_file(actual_config_path, rule) -> Tuple
                 one_instance_when_started_from_file = line.split('=')[-1].strip()
 
         if one_instance_when_started_from_file == expected_one_instance_when_started_from_file:
-            status = "disabled" if one_instance_when_started_from_file == "0" else "enabled"
-            return 1, f"one-instance-when-started-from-file is correctly {status}"
+            return 1
         else:
-            expected_status = "disabled" if expected_one_instance_when_started_from_file == "0" else "enabled"
-            actual_status = "disabled" if one_instance_when_started_from_file == "0" else "enabled"
-            return 0, f"one-instance-when-started-from-file mismatch - Expected: {expected_status}, Found: {actual_status}"
+            return 0
     except FileNotFoundError:
         logger.error("VLC configuration file not found.")
-        return 0, "VLC configuration file not found"
+        return 0
     except Exception as e:
         logger.error(f"An error occurred: {e}")
-        return 0, f"Error reading VLC configuration: {str(e)}"
+        return 0

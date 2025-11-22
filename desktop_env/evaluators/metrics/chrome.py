@@ -3,8 +3,9 @@ import os
 import re
 import shutil
 import io
+import time
 from itertools import product
-from typing import Any, Dict, List, Union, Tuple
+from typing import Any, Dict, List, Union
 
 import rapidfuzz.fuzz as fuzz
 from bs4 import BeautifulSoup, Tag
@@ -14,12 +15,12 @@ from desktop_env.evaluators.metrics.utils import are_lists_equal, compare_urls
 logger = logging.getLogger("desktopenv.metrics.chrome")
 
 
-def is_expected_active_tab(active_tab_info: Dict[str, str], rule: Dict[str, Any]) -> Tuple[float, str]:
+def is_expected_active_tab(active_tab_info: Dict[str, str], rule: Dict[str, Any]) -> float:
     """
     Checks if the expected active tab is open in Chrome.
     """
     if not active_tab_info:
-        return 0., "No active tab information available"
+        return 0.
 
     match_type = rule['type']
 
@@ -29,23 +30,20 @@ def is_expected_active_tab(active_tab_info: Dict[str, str], rule: Dict[str, Any]
             actual_url = active_tab_info.get('url', None)
         else:
             actual_url = active_tab_info
-        print("expected_url: {}".format(expected_url))
-        print("actual_url: {}".format(actual_url))
-        if compare_urls(expected_url, actual_url):
-            return 1., f"Active tab URL matches expected: {expected_url}"
-        else:
-            return 0., f"Active tab URL mismatch - Expected: {expected_url}, Actual: {actual_url}"
+        logger.info("expected_url: {}".format(expected_url))
+        logger.info("actual_url: {}".format(actual_url))
+        return 1 if compare_urls(expected_url, actual_url) else 0
     else:
         logger.error(f"Unknown type: {match_type}")
-        return 0., f"Unknown match type: {match_type}"
+        return 0
 
 
-def is_expected_active_tab_approximate(active_tab_info: Dict[str, str], rule: Dict[str, Any]) -> Tuple[float, str]:
+def is_expected_active_tab_approximate(active_tab_info: Dict[str, str], rule: Dict[str, Any]) -> float:
     """
     Checks if the expected active tab is open in Chrome, ignoring query parameters in the URL.
     """
     if not active_tab_info:
-        return 0., "No active tab information available"
+        return 0.
 
     match_type = rule['type']
 
@@ -59,45 +57,54 @@ def is_expected_active_tab_approximate(active_tab_info: Dict[str, str], rule: Di
         def strip_query(url):
             parsed = urlparse(url)
             return urlunparse(parsed._replace(query=""))
-        expected_stripped = strip_query(expected_url)
-        actual_stripped = strip_query(actual_url)
-        if expected_stripped == actual_stripped:
-            return 1., f"Active tab URL matches expected (ignoring query params): {expected_stripped}"
+        if strip_query(expected_url) == strip_query(actual_url):
+            return 1
         else:
-            return 0., f"Active tab URL mismatch - Expected: {expected_stripped}, Actual: {actual_stripped}"
+            return 0
     else:
         logger.error(f"Unknown type: {match_type}")
-        return 0., f"Unknown match type: {match_type}"
+        return 0
 
 
 # rules[expected] is a string-formatted regex
-def is_expected_url_pattern_match(result, rules) -> Tuple[float, str]:
+def is_expected_url_pattern_match(result, rules) -> float:
     """
     This function is used to search the expected pattern in the url using regex.
     result is the return value of function "activte_tab_info" or return value of function "get_active_url_from_accessTree"   
     """
     if not result:
-        return 0., "No result provided for URL pattern matching"
+        return 0.
 
-    if type(result) == dict:
-        result_url = result["url"]
-        print("result url: {}".format(result_url))
-    else:
+    # Extract URL from result parameter - result can be either a string URL or a dict with 'url' field
+    if isinstance(result, str):
         result_url = result
+        logger.info("result url: {}".format(result_url))
+    elif isinstance(result, dict) and 'url' in result:
+        result_url = result['url']
+        logger.info("result url: {}".format(result_url))
+    else:
+        logger.error(f"Invalid result format: {type(result)}, expected string URL or dict with 'url' field")
+        return 0.
+
+    logger.info(f"Result URL to match: {result_url}")
+    
     # expect_regex = re.compile(rules["expected"])
     patterns = rules["expected"]
-    print("expected_regex: {}".format(patterns))
+    logger.info("expected_regex: {}".format(patterns))
     for pattern in patterns:
         match = re.search(pattern, result_url)
-        print(match)
+        logger.info("match: {}".format(match))
         if not match:
-            return 0., f"URL pattern '{pattern}' not found in URL: {result_url}"
-    return 1., f"All URL patterns matched in: {result_url}"
+            return 0.
+    return 1.
 
 
-def is_expected_installed_extensions(installed_extensions, expected) -> Tuple[float, str]:
-    print("installed_extensions: ")
-    print(installed_extensions)
+def is_expected_installed_extensions(installed_extensions, expected) -> float:
+    if not installed_extensions:
+        return 0.
+
+    logger.info("installed_extensions: ")
+    logger.info(installed_extensions)
     expected_extensions = expected["expected"]
 
     # whether the expected extensions are installed
@@ -105,16 +112,17 @@ def is_expected_installed_extensions(installed_extensions, expected) -> Tuple[fl
     set_installed_extensions = set(installed_extensions)
 
     if set_expected_extensions.issubset(set_installed_extensions):
-        return 1., f"All expected extensions are installed: {expected_extensions}"
+        return 1.
     else:
-        missing = set_expected_extensions - set_installed_extensions
-        return 0., f"Missing extensions: {missing}"
+        return 0.
 
 
-def is_expected_tabs(open_tabs: List[Dict[str, str]], rule: Dict[str, Any]) -> Tuple[float, str]:
+def is_expected_tabs(open_tabs: List[Dict[str, str]], rule: Dict[str, Any]) -> float:
     """
     Checks if the expected tabs are open in Chrome.
     """
+    if not open_tabs:
+        return 0.
 
     match_type = rule['type']
 
@@ -125,41 +133,37 @@ def is_expected_tabs(open_tabs: List[Dict[str, str]], rule: Dict[str, Any]) -> T
             logger.error("list not match") 
             logger.error(expected_urls)
             logger.error(actual_urls)
-            return 0., f"Tab URLs don't match - Expected: {expected_urls}, Actual: {actual_urls}"
-        return 1., f"All expected tabs are open with correct URLs"
+            return 0
+        return 1 if are_lists_equal(expected_urls, actual_urls, compare_urls) else 0
     else:
         logger.error(f"Unknown type: {match_type}")
-        return 0., f"Unknown match type: {match_type}"
+        return 0
 
 
-def is_expected_bookmarks(bookmarks: List[str], rule: Dict[str, Any]) -> Tuple[float, str]:
+def is_expected_bookmarks(bookmarks: List[str], rule: Dict[str, Any]) -> float:
     """
     Checks if the expected bookmarks are in Chrome.
     """
     if not bookmarks:
-        return 0., "No bookmarks found"
+        return 0.
     elif rule['type'] == "bookmark_bar_folders_names":
         bookmark_bar_folders_names = [bookmark['name'] for bookmark in bookmarks['bookmark_bar']['children'] if
                                       bookmark['type'] == 'folder']
-        if set(bookmark_bar_folders_names) == set(rule['names']):
-            return 1., f"Bookmark bar folders match expected: {rule['names']}"
-        else:
-            return 0., f"Bookmark bar folders mismatch - Expected: {rule['names']}, Actual: {bookmark_bar_folders_names}"
+        return 1. if set(bookmark_bar_folders_names) == set(rule['names']) else 0.
     elif rule['type'] == "bookmark_bar_websites_urls":
         bookmark_bar_websites_urls = [bookmark['url'] for bookmark in bookmarks['bookmark_bar']['children'] if
                                       bookmark['type'] == 'url']
-        if set(bookmark_bar_websites_urls) == set(rule['urls']):
-            return 1., f"Bookmark bar URLs match expected"
-        else:
-            return 0., f"Bookmark bar URLs mismatch - Expected: {rule['urls']}, Actual: {bookmark_bar_websites_urls}"
+        return 1. if set(bookmark_bar_websites_urls) == set(rule['urls']) else 0.
     elif rule['type'] == "liked_authors_websites_urls":
         # Check if "liked authors" folder exists
         liked_authors_folder = next((bookmark for bookmark in bookmarks['bookmark_bar']['children'] if
                                      bookmark['type'] == 'folder' and bookmark['name'] == 'Liked Authors'), None)
         if liked_authors_folder:
             # Check if it contains the specified URLs
+            logger.info("'Liked Authors' folder exists")
             liked_authors_urls = [bookmark['url'] for bookmark in liked_authors_folder['children'] if
                                   bookmark['type'] == 'url']
+            logger.info("Here is the 'Liked Authors' folder's urls: {}".format(liked_authors_urls))
 
             urls = rule['urls']
 
@@ -171,24 +175,27 @@ def is_expected_bookmarks(bookmarks: List[str], rule: Dict[str, Any]) -> Tuple[f
 
             for combination in combinations:
                 if set(combination) == set(liked_authors_urls):
-                    return 1., f"Liked Authors folder contains expected URLs"
-            return 0., f"Liked Authors folder URLs mismatch - Actual: {liked_authors_urls}"
+                    return 1.
+            return 0.
         else:
-            return 0., "Liked Authors folder not found in bookmarks"
+            return 0.
     else:
         raise TypeError(f"{rule['type']} not support yet!")
 
 
-def is_expected_search_query(active_tab_info: Dict[str, str], rules: Dict[str, Any]) -> Tuple[float, str]:
+def is_expected_search_query(active_tab_info: Dict[str, str], rules: Dict[str, Any]) -> float:
+    if not active_tab_info:
+        return 0.
+
     expected = rules['expect']
     pattern = expected['pattern']
     matched = re.search(pattern, active_tab_info['url'])
     if matched:
-        return 1., f"Search query pattern '{pattern}' found in URL"
-    return 0., f"Search query pattern '{pattern}' not found in URL: {active_tab_info['url']}"
+        return 1.
+    return 0.
 
 
-def compare_pdfs(pdf1_path: Union[str, List[str]], pdf2_path: Union[str, List[str]]) -> Tuple[float, str]:
+def compare_pdfs(pdf1_path: Union[str, List[str]], pdf2_path: Union[str, List[str]]):
     """
     Compare two PDF files.
     """
@@ -204,20 +211,14 @@ def compare_pdfs(pdf1_path: Union[str, List[str]], pdf2_path: Union[str, List[st
         return text.strip()
 
     score = 0.
-    reasons = []
     for path1, path2 in zip(pdf1_path, pdf2_path):
         try:
             text1 = extract_text_from_pdf(path1)
             text2 = extract_text_from_pdf(path2)
-            similarity = fuzz.ratio(text1, text2) / 100
-            score += similarity
-            reasons.append(f"PDF similarity: {similarity:.2%}")
+            score += fuzz.ratio(text1, text2) / 100
         except Exception as e:
             logger.info(f"[ERROR]: unexpected error occurred when comparing PDF files: {e}")
-            reasons.append(f"Error comparing PDFs: {e}")
-    
-    avg_score = score / len(pdf2_path)
-    return avg_score, f"Average PDF similarity: {avg_score:.2%} - Details: {'; '.join(reasons)}"
+    return score / len(pdf2_path)
 
 
 import fitz
@@ -228,14 +229,15 @@ import imagehash
 
 from pathlib import Path
 import typing
+import time
 
 
-def compare_pdf_images(pdf1_path: str, pdf2_path: str, **kwargs) -> Tuple[float, str]:
+def compare_pdf_images(pdf1_path: str, pdf2_path: str, **kwargs) -> float:
     if not pdf1_path or not pdf2_path:
-        return 0., "Missing PDF path(s) for comparison"
+        return 0.
     if not all(map(os.path.exists, [pdf1_path, pdf2_path])):
         logger.warning(f"PDF file does not exist: {pdf1_path} or {pdf2_path}")
-        return 0., f"PDF file does not exist: {pdf1_path} or {pdf2_path}"
+        return 0.
 
     def extract_images_from_pdf(pdf_path):
         pdf_document = fitz.open(pdf_path)
@@ -272,22 +274,21 @@ def compare_pdf_images(pdf1_path: str, pdf2_path: str, **kwargs) -> Tuple[float,
     except Exception as e:
         logger.error(f"Error extracting images from PDFs: {e}")
         shutil.rmtree(temp_dir)
-        return 0., f"Error extracting images from PDFs: {e}"
+        return 0.
     finally:
         shutil.rmtree(temp_dir)
 
 
     if len(images1) != len(images2):
         logger.info(f"Different number of images found. Gold: {len(images1)}, Pred: {len(images2)}")
-        return 0., f"Different number of images - Expected: {len(images1)}, Actual: {len(images2)}"
+        return 0.
 
     if not images1:
         logger.info("No images found in either PDF. Considering it a match.")
-        return 1.0, "No images found in either PDF - considered a match"
+        return 1.0
 
     hash_threshold = 5 
     total_score = 0
-    mismatched_images = []
     for i, (img1, img2) in enumerate(zip(images1, images2)):
         hash1 = imagehash.phash(img1)
         hash2 = imagehash.phash(img2)
@@ -297,24 +298,18 @@ def compare_pdf_images(pdf1_path: str, pdf2_path: str, **kwargs) -> Tuple[float,
 
         if hash_diff <= hash_threshold:
             total_score +=1
-        else:
-            mismatched_images.append(i+1)
     
-    score = total_score / len(images1)
-    if score == 1.0:
-        return score, f"All {len(images1)} images match"
-    else:
-        return score, f"Image match score: {score:.2%} - Mismatched images: {mismatched_images}"
+    return total_score / len(images1)
 
 
-def compare_archive(pred_path: str, gold_path: str, **kwargs) -> Tuple[float, str]:
+def compare_archive(pred_path: str, gold_path: str, **kwargs) -> float:
     """
     Compare two archives. Note that the files in the archives should be of the same type.
     """
     file_path = kwargs.pop('file_path', '')
 
     if not pred_path:
-        return 0., "No prediction path provided"
+        return 0.
     pred_folder = os.path.splitext(pred_path)[0] + '_pred'
     gold_folder = os.path.splitext(gold_path)[0] + '_gold'
 
@@ -331,7 +326,7 @@ def compare_archive(pred_path: str, gold_path: str, **kwargs) -> Tuple[float, st
     gold_files = sorted(os.listdir(os.path.join(gold_folder, file_path)))
 
     if pred_files != gold_files:
-        return 0., f"Archive file lists don't match - Expected: {gold_files}, Actual: {pred_files}"
+        return 0.
 
     def get_compare_function():
         file_type = kwargs.pop('file_type', 'text')
@@ -366,64 +361,53 @@ def compare_archive(pred_path: str, gold_path: str, **kwargs) -> Tuple[float, st
 
     score = 0
     compare_function = get_compare_function()
-    file_results = []
     for f1, f2 in zip(pred_files, gold_files):
         fp1 = os.path.join(pred_folder, file_path, f1)
         fp2 = os.path.join(gold_folder, file_path, f2)
-        file_score, file_reason = compare_function(fp1, fp2, **kwargs)
-        score += file_score
-        file_results.append(f"{f1}: {file_reason}")
-    
-    avg_score = score / len(pred_files)
-    return avg_score, f"Archive comparison - Average score: {avg_score:.2%}, Files: {'; '.join(file_results)}"
+        score += compare_function(fp1, fp2, **kwargs)
+    return score / len(pred_files)
 
 
-def compare_htmls(html_path1: str, html_path2: str, **options) -> Tuple[float, str]:
+def compare_htmls(html_path1: str, html_path2: str, **options) -> float:
     """
     Compare two HTML files.
     """
-    try:
-        with open(html_path1, 'r', encoding='utf-8') as inf:
-            soup1 = BeautifulSoup(inf, 'lxml')
-        with open(html_path2, 'r', encoding='utf-8') as inf:
-            soup2 = BeautifulSoup(inf, 'lxml')
-    except Exception as e:
-        return 0., f"Error reading HTML files: {e}"
-    
+    with open(html_path1, 'r', encoding='utf-8') as inf:
+        soup1 = BeautifulSoup(inf, 'lxml')
+    with open(html_path2, 'r', encoding='utf-8') as inf:
+        soup2 = BeautifulSoup(inf, 'lxml')
     ignore_sdnum = options.get("ignore_sdnum", None)
 
     def compare_elements(elem1, elem2):
         if not (isinstance(elem1, Tag) and isinstance(elem2, Tag)):
             if elem1 != elem2:
                 logger.info("not the same")
-            return elem1 == elem2, "Element types or values don't match"
+            return elem1 == elem2
         if elem1.name != elem2.name:
             logger.info("html name not match")
-            return False, f"Tag names don't match: {elem1.name} vs {elem2.name}"
+            return False
         if elem1.text.strip() != elem2.text.strip():
             logger.info("html text not match")
-            return False, f"Text content doesn't match"
+            return False
         if elem1.attrs != elem2.attrs:
             if ignore_sdnum:
                 attrs1 = {k: v for k, v in elem1.attrs.items() if k != 'sdnum'}
                 attrs2 = {k: v for k, v in elem2.attrs.items() if k != 'sdnum'}
-                if attrs1 == attrs2:
-                    return True, "Attributes match (ignoring sdnum)"
+                return attrs1 == attrs2
             logger.info("html attrs not match")
             logger.info(f"{elem1.attrs}")
             logger.info(f"{elem2.attrs}")
-            return False, f"Attributes don't match"
-        return True, "Elements match"
+            return False
+        return True
 
     for elem1, elem2 in zip(soup1.recursiveChildGenerator(), soup2.recursiveChildGenerator()):
-        match, reason = compare_elements(elem1, elem2)
-        if not match:
+        if not compare_elements(elem1, elem2):
             logger.info("html not match")
-            return 0., f"HTML mismatch: {reason}"
-    return 1., "HTML files are identical"
+            return .0
+    return 1.
 
 
-def is_cookie_deleted(cookie_data, rule) -> Tuple[float, str]:
+def is_cookie_deleted(cookie_data, rule):
     """
     Check if the cookie is deleted.
     """
@@ -433,13 +417,13 @@ def is_cookie_deleted(cookie_data, rule) -> Tuple[float, str]:
         for domain in rule['domains']:
             for cookies_domain in cookies_domains:
                 if compare_urls(domain, cookies_domain):
-                    return 0., f"Cookie still exists for domain: {domain}"
-        return 1., f"All cookies deleted for domains: {rule['domains']}"
+                    return 0.
+        return 1.
     else:
         raise TypeError(f"{rule['type']} not support yet!")
 
 
-def is_shortcut_on_desktop(shortcuts: Dict[str, str], rule) -> Tuple[float, str]:
+def is_shortcut_on_desktop(shortcuts: Dict[str, str], rule):
     """
     Check if the shortcut is on the desktop.
     """
@@ -447,13 +431,13 @@ def is_shortcut_on_desktop(shortcuts: Dict[str, str], rule) -> Tuple[float, str]
     if rule['type'] == 'name':
         for shortcut_path, shortcut_content in shortcuts.items():
             if "Name=" + rule['name'] + "\n" in shortcut_content:
-                return 1., f"Shortcut with name '{rule['name']}' found on desktop"
-        return 0.0, f"Shortcut with name '{rule['name']}' not found on desktop"
+                return 1.
+        return 0.0
     elif rule['type'] == 'exec':
         for shortcut_path, shortcut_content in shortcuts.items():
             if "Exec=" + rule['exec'] + "\n" in shortcut_content:
-                return 1., f"Shortcut with exec '{rule['exec']}' found on desktop"
-        return 0.0, f"Shortcut with exec '{rule['exec']}' not found on desktop"
+                return 1.
+        return 0.0
     elif rule['type'] == 'url':
         raise TypeError(f"{rule['type']} not support yet!")
     elif rule['type'] == 'id':
@@ -462,7 +446,7 @@ def is_shortcut_on_desktop(shortcuts: Dict[str, str], rule) -> Tuple[float, str]
         raise TypeError(f"{rule['type']} not support yet!")
 
 
-def check_history_deleted(history_data, rule) -> Tuple[float, str]:
+def check_history_deleted(history_data, rule):
     """
     Check if the history is deleted.
     """
@@ -472,48 +456,39 @@ def check_history_deleted(history_data, rule) -> Tuple[float, str]:
         for keyword in rule['keywords']:
             for history_domain in history_domains:
                 if keyword in history_domain:
-                    return 0., f"History still contains keyword: '{keyword}' in domain: {history_domain}"
-        return 1., f"History successfully deleted for keywords: {rule['keywords']}"
+                    return 0.
+        return 1.
     else:
         raise TypeError(f"{rule['type']} not support yet!")
 
 
-def check_enabled_experiments(enabled_experiments, rule) -> Tuple[float, str]:
+def check_enabled_experiments(enabled_experiments, rule):
     """
     Check if the enabled experiments are as expected.
     """
     enabled_experiments_names = [experiment.split("@")[0] for experiment in enabled_experiments]
 
     if rule['type'] == 'names':
-        if enabled_experiments_names == rule['names']:
-            return 1., f"Enabled experiments match expected: {rule['names']}"
-        else:
-            return 0., f"Enabled experiments mismatch - Expected: {rule['names']}, Actual: {enabled_experiments_names}"
+        return 1. if enabled_experiments_names == rule['names'] else 0.
     else:
         raise TypeError(f"{rule['type']} not support yet!")
 
 
-def check_font_size(font_size, rule) -> Tuple[float, str]:
+def check_font_size(font_size, rule):
     """
     Check if the font size is as expected.
     """
 
     default_font_size = font_size['default_font_size']
     if rule['type'] == 'value':
-        if default_font_size == rule['value']:
-            return 1., f"Font size matches expected value: {rule['value']}"
-        else:
-            return 0., f"Font size mismatch - Expected: {rule['value']}, Actual: {default_font_size}"
+        return 1. if default_font_size == rule['value'] else 0.
     elif rule['type'] == 'range':
-        if rule['min'] < default_font_size < rule['max']:
-            return 1., f"Font size {default_font_size} is within expected range: ({rule['min']}, {rule['max']})"
-        else:
-            return 0., f"Font size {default_font_size} is outside expected range: ({rule['min']}, {rule['max']})"
+        return 1. if rule['min'] < default_font_size < rule['max'] else 0.
     else:
         raise TypeError(f"{rule['type']} not support yet!")
 
 
-def is_added_to_steam_cart(active_tab_info, rule) -> Tuple[float, str]:
+def is_added_to_steam_cart(active_tab_info, rule):
     """
     Check if the item is added to the Steam cart.
     """
@@ -521,12 +496,8 @@ def is_added_to_steam_cart(active_tab_info, rule) -> Tuple[float, str]:
 
     content = active_tab_info['content']
 
-    missing_items = []
     for item in items:
         if item not in content:
-            missing_items.append(item)
+            return 0.
 
-    if missing_items:
-        return 0., f"Items not found in Steam cart: {missing_items}"
-    else:
-        return 1., f"All items found in Steam cart: {items}"
+    return 1.

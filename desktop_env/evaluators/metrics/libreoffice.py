@@ -25,4 +25,4 @@ def check_libre_locale(config_file: str, rules: Dict[str, List[str]]) -> float:
     return float(any(fnmatch.fnmatchcase(setup_locale_setting, ptn) \
                      for ptn in rules["locale_set"]
                      )
-                 ), ""
+                 )

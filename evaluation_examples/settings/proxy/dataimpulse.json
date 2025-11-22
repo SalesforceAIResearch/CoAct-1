@@ -1,0 +1,13 @@
+[
+    {
+        "host": "gw.dataimpulse.com",
+        "port": 823,
+        "username": "8d7e8967dececc2e5826",
+        "password": "fad51eb36c237896",
+        "protocol": "http",
+        "provider": "dataimpulse",
+        "type": "residential",
+        "country": "US",
+        "note": "Dataimpulse Residential Proxy"
+    }
+]

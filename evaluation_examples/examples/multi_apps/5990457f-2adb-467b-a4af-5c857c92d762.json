@@ -9,7 +9,6 @@
       "parameters": {
         "command": [
           "google-chrome",
-          "--proxy-server=http://127.0.0.1:18888",
           "--remote-debugging-port=1337"
         ]
       }
@@ -105,5 +104,7 @@
       "ignore_case": true
     }
   },
-  "proxy": true
+  "proxy": true,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low"
 }

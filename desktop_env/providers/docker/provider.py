@@ -15,7 +15,7 @@ logger.setLevel(logging.INFO)
 
 WAIT_TIME = 3
 RETRY_INTERVAL = 1
-LOCK_TIMEOUT = 10
+LOCK_TIMEOUT = 600
 
 
 class PortAllocationError(Exception):
@@ -84,24 +84,33 @@ class DockerProvider(Provider):
         
         raise TimeoutError("VM failed to become ready within timeout period")
 
-    def start_emulator(self, path_to_vm: str, headless: bool, os_type: str, **kwargs):
+    def start_emulator(self, path_to_vm: str, headless: bool, os_type: str):
         # Use a single lock for all port allocation and container startup
         lock = FileLock(str(self.lock_file), timeout=LOCK_TIMEOUT)
         
         try:
             with lock:
                 # Allocate all required ports
-                self.vnc_port = self._get_available_port(8007)
+                self.vnc_port = self._get_available_port(8006)
                 self.server_port = self._get_available_port(5000)
                 self.chromium_port = self._get_available_port(9222)
                 self.vlc_port = self._get_available_port(8080)
 
                 # Start container while still holding the lock
+                # Check if KVM is available
+                devices = []
+                if os.path.exists("/dev/kvm"):
+                    devices.append("/dev/kvm")
+                    logger.info("KVM device found, using hardware acceleration")
+                else:
+                    self.environment["KVM"] = "N"
+                    logger.warning("KVM device not found, running without hardware acceleration (will be slower)")
+
                 self.container = self.client.containers.run(
                     "happysixd/osworld-docker",
                     environment=self.environment,
                     cap_add=["NET_ADMIN"],
-                    devices=["/dev/kvm"],
+                    devices=devices,
                     volumes={
                         os.path.abspath(path_to_vm): {
                             "bind": "/System.qcow2",
@@ -124,7 +133,6 @@ class DockerProvider(Provider):
             self._wait_for_vm_ready()
 
         except Exception as e:
-            logger.error(f"Error starting container: {e}")
             # Clean up if anything goes wrong
             if self.container:
                 try:
@@ -133,12 +141,8 @@ class DockerProvider(Provider):
                 except:
                     pass
             raise e
-        finally:
-            print('I was reached')
-            return {"name": 'YD_ADDed_DEBUG'}
 
     def get_ip_address(self, path_to_vm: str) -> str:
-        logger.info(f"self.server_port: {self.server_port}, self.chromium_port: {self.chromium_port}, self.vnc_port: {self.vnc_port}, self.vlc_port: {self.vlc_port}")
         if not all([self.server_port, self.chromium_port, self.vnc_port, self.vlc_port]):
             raise RuntimeError("VM not started - ports not allocated")
         return f"localhost:{self.server_port}:{self.chromium_port}:{self.vnc_port}:{self.vlc_port}"
@@ -149,7 +153,9 @@ class DockerProvider(Provider):
     def revert_to_snapshot(self, path_to_vm: str, snapshot_name: str):
         self.stop_emulator(path_to_vm)
 
-    def stop_emulator(self, path_to_vm: str):
+    def stop_emulator(self, path_to_vm: str, region=None, *args, **kwargs):
+        # Note: region parameter is ignored for Docker provider
+        # but kept for interface consistency with other providers
         if self.container:
             logger.info("Stopping VM...")
             try:

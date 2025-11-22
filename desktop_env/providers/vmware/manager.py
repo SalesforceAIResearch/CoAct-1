@@ -29,13 +29,11 @@ UBUNTU_X86_URL = "https://huggingface.co/datasets/xlangai/ubuntu_osworld/resolve
 WINDOWS_X86_URL = "https://huggingface.co/datasets/xlangai/windows_osworld/resolve/main/Windows-x86.zip"
 
 # Determine the platform and CPU architecture to decide the correct VM image to download
-if platform.system() == 'Darwin':  # macOS
-    # if os.uname().machine == 'arm64':  # Apple Silicon
-    URL = UBUNTU_ARM_URL
-# else:
-#     url = UBUNTU_X86_URL
-elif platform.machine().lower() in ['amd64', 'x86_64']:
+# sometimes the system is 'Darwin' but the machine is x86-based.​​ 
+if platform.machine().lower() in ['amd64', 'x86_64']:
     URL = UBUNTU_X86_URL
+elif platform.system() == 'Darwin':  # macOS
+    URL = UBUNTU_ARM_URL
 else:
     raise Exception("Unsupported platform or architecture")
 
@@ -125,15 +123,22 @@ def _install_vm(vm_name, vms_dir, downloaded_file_name, os_type, original_vm_nam
         # Download the virtual machine image
         logger.info("Downloading the virtual machine image...")
         downloaded_size = 0
-
+        # sometimes the system is 'Darwin' but the machine is x86-based.​​ 
         if os_type == "Ubuntu":
-            if platform.system() == 'Darwin':
-                URL = UBUNTU_ARM_URL
-            elif platform.machine().lower() in ['amd64', 'x86_64']:
+            if platform.machine().lower() in ['amd64', 'x86_64']:
                 URL = UBUNTU_X86_URL
+            elif platform.system() == 'Darwin':
+                URL = UBUNTU_ARM_URL
         elif os_type == "Windows":
             if platform.machine().lower() in ['amd64', 'x86_64']:
                 URL = WINDOWS_X86_URL
+        
+        # Check for HF_ENDPOINT environment variable and replace domain if set to hf-mirror.com
+        hf_endpoint = os.environ.get('HF_ENDPOINT')
+        if hf_endpoint and 'hf-mirror.com' in hf_endpoint:
+            URL = URL.replace('huggingface.co', 'hf-mirror.com')
+            logger.info(f"Using HF mirror: {URL}")
+        
         DOWNLOADED_FILE_NAME = URL.split('/')[-1]
         downloaded_file_name = DOWNLOADED_FILE_NAME
 
@@ -256,6 +261,8 @@ def _install_vm(vm_name, vms_dir, downloaded_file_name, os_type, original_vm_nam
 
     # Try downloading the screenshot until successful
     while not download_screenshot(vm_ip):
+        # Try to get the IP again in case it has changed
+        vm_ip = get_vm_ip(vm_path)
         logger.info("Check whether the virtual machine is ready...")
 
     logger.info("Virtual machine is ready. Start to make a snapshot on the virtual machine. It would take a while...")
@@ -415,7 +422,9 @@ class VMwareVMManager(VMManager):
                         free_vms.append((vm_path, pid_str))
             return free_vms
 
-    def get_vm_path(self, os_type, region=None):
+    def get_vm_path(self, os_type, region=None, screen_size=(1920, 1080), **kwargs):
+        # Note: screen_size parameter is ignored for VMware provider
+        # but kept for interface consistency with other providers
         with self.lock:
             if not VMwareVMManager.checked_and_cleaned:
                 VMwareVMManager.checked_and_cleaned = True

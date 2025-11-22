@@ -32,6 +32,12 @@
   "evaluator": {
     "postconfig": [
       {
+        "type": "activate_window",
+        "parameters": {
+          "window_name": "GNU Image Manipulation Program"
+        }
+      },
+      {
         "type": "execute",
         "parameters": {
           "command": [
@@ -82,8 +88,8 @@
     ],
     "func": "check_contrast_increase_and_structure_sim",
     "expected": {
-      "type": "vm_file",
-      "path": "/home/user/Desktop/berries.png",
+      "type": "cloud_file",
+      "path": "https://huggingface.co/datasets/xlangai/ubuntu_osworld_file_cache/resolve/main/gimp/f723c744-e62c-4ae6-98d1-750d3cd7d79d/file_1X42_kOanL74vu_p6QdcZuiyzDQi3kA7F.jpg",
       "dest": "berries.png"
     },
     "result": {
@@ -92,5 +98,7 @@
       "dest": "berries_contrast.png"
     }
   },
-  "proxy": false
+  "proxy": false,
+  "fixed_ip": false,
+  "possibility_of_env_change": "low"
 }
